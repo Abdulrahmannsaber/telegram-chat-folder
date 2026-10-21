@@ -1,0 +1,1683 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java
+index 52238e832..c9ef97a2d 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/FilterTabsView.java
+@@ -118,6 +118,7 @@ public class FilterTabsView extends FrameLayout {
+ 
+     public class Tab {
+         public int id;
++        public int dialogFilterId = -1;
+         public CharSequence title;
+         public int titleWidth;
+         public int counter;
+@@ -264,6 +265,12 @@ public class FilterTabsView extends FrameLayout {
+             return currentTab.id;
+         }
+ 
++        private void invalidateExternalDragTextLayout() {
++            currentText = null;
++            requestLayout();
++            invalidate();
++        }
++
+         @Override
+         protected void onDetachedFromWindow() {
+             attached = false;
+@@ -830,6 +837,23 @@ public class FilterTabsView extends FrameLayout {
+     private int aUnactiveTextColorKey = -1;
+     private int aBackgroundColorKey = -1;
+ 
++    private final Paint externalDragTargetPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final int[] externalDragLocation = new int[2];
++    private final Runnable externalDragScrollRunnable = this::runExternalDragScroll;
++    private boolean externalDragActive;
++    private int externalDragTargetPosition = RecyclerView.NO_POSITION;
++    private int externalDragScrollDirection;
++    private float externalDragScrollSpeed;
++    private float externalDragRawX = Float.NaN;
++    private View externalDragTargetView;
++    private ValueAnimator externalDragTargetAnimator;
++    private float externalDragTargetProgress;
++    private ValueAnimator externalDragExpansionAnimator;
++    private int externalDragBaseHeight;
++    private int externalDragBasePaddingTop;
++    private int externalDragBasePaddingBottom;
++    private float externalDragBaseTextSize;
++
+     private int prevLayoutWidth;
+ 
+     private boolean invalidated;
+@@ -1138,12 +1162,46 @@ public class FilterTabsView extends FrameLayout {
+             public void onScrolled(@NonNull RecyclerView recyclerView, int dx, int dy) {
+                 listView.invalidate();
+                 invalidate();
++                if (externalDragActive && !Float.isNaN(externalDragRawX)) {
++                    updateExternalDragTarget();
++                }
+             }
+         });
+         listView.setAdaptiveOverScroll();
+         addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+     }
+ 
++    @Override
++    protected void onDetachedFromWindow() {
++        removeCallbacks(externalDragScrollRunnable);
++        externalDragActive = false;
++        externalDragScrollDirection = 0;
++        externalDragScrollSpeed = 0f;
++        externalDragRawX = Float.NaN;
++        externalDragTargetPosition = RecyclerView.NO_POSITION;
++        externalDragTargetView = null;
++        externalDragTargetProgress = 0f;
++        if (externalDragTargetAnimator != null) {
++            externalDragTargetAnimator.cancel();
++            externalDragTargetAnimator = null;
++        }
++        if (externalDragExpansionAnimator != null) {
++            externalDragExpansionAnimator.cancel();
++            externalDragExpansionAnimator = null;
++        }
++        if (externalDragBaseTextSize > 0f) {
++            setExternalDragTextSize(false);
++        }
++        if (externalDragBaseHeight > 0 && getLayoutParams() != null) {
++            ViewGroup.LayoutParams layoutParams = getLayoutParams();
++            layoutParams.height = externalDragBaseHeight;
++            setLayoutParams(layoutParams);
++            setPadding(getPaddingLeft(), externalDragBasePaddingTop, getPaddingRight(), externalDragBasePaddingBottom);
++        }
++        invalidate();
++        super.onDetachedFromWindow();
++    }
++
+     public void setDelegate(FilterTabsViewDelegate filterTabsViewDelegate) {
+         delegate = filterTabsViewDelegate;
+     }
+@@ -1230,6 +1288,280 @@ public class FilterTabsView extends FrameLayout {
+         return listView;
+     }
+ 
++    public boolean isInsideExternalDragMagneticZone(float rawX, float rawY, boolean attached) {
++        getLocationOnScreen(externalDragLocation);
++        float touchAnchorY = rawY - dp(30);
++        int verticalHysteresis = attached ? dp(45) : dp(25);
++        return rawX >= externalDragLocation[0]
++                && rawX <= externalDragLocation[0] + getWidth()
++                && rawY >= AndroidUtilities.statusBarHeight
++                && touchAnchorY <= externalDragLocation[1] + getHeight() + verticalHysteresis;
++    }
++
++    public void startExternalDrag() {
++        if (externalDragActive) {
++            return;
++        }
++        externalDragActive = true;
++        setExternalDragTextSize(true);
++        animateExternalDragExpansion(true);
++    }
++
++    public int updateExternalDrag(float rawX) {
++        startExternalDrag();
++
++        externalDragRawX = rawX;
++        listView.getLocationOnScreen(externalDragLocation);
++        float localX = rawX - externalDragLocation[0];
++        int edge = dp(48);
++        if (localX < edge) {
++            externalDragScrollDirection = -1;
++        } else if (localX > listView.getWidth() - edge) {
++            externalDragScrollDirection = 1;
++        } else {
++            externalDragScrollDirection = 0;
++        }
++        externalDragScrollSpeed = externalDragScrollDirection == 0 ? 0f : dp(5);
++
++        updateExternalDragTarget();
++        removeCallbacks(externalDragScrollRunnable);
++        if (externalDragScrollDirection != 0) {
++            postOnAnimation(externalDragScrollRunnable);
++        }
++        return externalDragTargetPosition;
++    }
++
++    public void clearExternalDragTarget() {
++        externalDragScrollDirection = 0;
++        externalDragScrollSpeed = 0f;
++        externalDragRawX = Float.NaN;
++        setExternalDragTargetPosition(RecyclerView.NO_POSITION);
++        removeCallbacks(externalDragScrollRunnable);
++        invalidate();
++    }
++
++    public int getExternalDragTargetPosition() {
++        return externalDragTargetPosition;
++    }
++
++    public boolean getExternalDragTargetCenterOnScreen(int position, int[] outLocation) {
++        if (outLocation == null || outLocation.length < 2) {
++            return false;
++        }
++        RecyclerView.ViewHolder holder = listView.findViewHolderForAdapterPosition(position);
++        if (holder == null) {
++            return false;
++        }
++        View target = holder.itemView;
++        target.getLocationOnScreen(outLocation);
++        outLocation[0] += target.getWidth() / 2;
++        outLocation[1] += target.getHeight() / 2;
++        return true;
++    }
++
++    public void stopExternalDrag() {
++        if (!externalDragActive && externalDragTargetPosition == RecyclerView.NO_POSITION) {
++            return;
++        }
++        externalDragActive = false;
++        externalDragScrollDirection = 0;
++        externalDragScrollSpeed = 0f;
++        externalDragRawX = Float.NaN;
++        setExternalDragTargetPosition(RecyclerView.NO_POSITION);
++        removeCallbacks(externalDragScrollRunnable);
++        setExternalDragTextSize(false);
++        animateExternalDragExpansion(false);
++        invalidate();
++    }
++
++    private void animateExternalDragExpansion(boolean expanded) {
++        if (externalDragBaseHeight == 0) {
++            externalDragBaseHeight = getHeight();
++            externalDragBasePaddingTop = getPaddingTop();
++            externalDragBasePaddingBottom = getPaddingBottom();
++        }
++        if (externalDragBaseHeight == 0 || getLayoutParams() == null) {
++            return;
++        }
++        if (externalDragExpansionAnimator != null) {
++            externalDragExpansionAnimator.cancel();
++        }
++        final int startHeight = getHeight();
++        final int startPaddingTop = getPaddingTop();
++        final int startPaddingBottom = getPaddingBottom();
++        final int extraPadding = expanded ? dp(12) : 0;
++        final int targetHeight = externalDragBaseHeight + extraPadding * 2;
++        final int targetPaddingTop = externalDragBasePaddingTop + extraPadding;
++        final int targetPaddingBottom = externalDragBasePaddingBottom + extraPadding;
++        externalDragExpansionAnimator = ValueAnimator.ofFloat(0f, 1f);
++        externalDragExpansionAnimator.setDuration(expanded ? 220 : 180);
++        externalDragExpansionAnimator.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
++        externalDragExpansionAnimator.addUpdateListener(animation -> {
++            float progress = (float) animation.getAnimatedValue();
++            ViewGroup.LayoutParams layoutParams = getLayoutParams();
++            layoutParams.height = Math.round(startHeight + (targetHeight - startHeight) * progress);
++            setLayoutParams(layoutParams);
++            int paddingTop = Math.round(startPaddingTop + (targetPaddingTop - startPaddingTop) * progress);
++            int paddingBottom = Math.round(startPaddingBottom + (targetPaddingBottom - startPaddingBottom) * progress);
++            setPadding(getPaddingLeft(), paddingTop, getPaddingRight(), paddingBottom);
++        });
++        externalDragExpansionAnimator.start();
++    }
++
++    private void setExternalDragTextSize(boolean expanded) {
++        if (externalDragBaseTextSize == 0) {
++            externalDragBaseTextSize = textPaint.getTextSize();
++        }
++        float targetSize = expanded ? dpf2(15.5f) : externalDragBaseTextSize;
++        if (Math.abs(textPaint.getTextSize() - targetSize) < 0.01f) {
++            return;
++        }
++        textPaint.setTextSize(targetSize);
++        allTabsWidth = 0;
++        for (int i = 0; i < tabs.size(); i++) {
++            allTabsWidth += tabs.get(i).getWidth(true) + dp(TAB_PADDING_WIDTH);
++        }
++        invalidated = true;
++        RecyclerView.ItemAnimator itemAnimator = listView.getItemAnimator();
++        listView.setItemAnimator(null);
++        adapter.notifyDataSetChanged();
++        listView.setItemAnimator(itemAnimator);
++        for (int i = 0; i < listView.getChildCount(); i++) {
++            View child = listView.getChildAt(i);
++            if (child instanceof TabView) {
++                ((TabView) child).invalidateExternalDragTextLayout();
++            }
++        }
++        requestLayout();
++        invalidate();
++    }
++
++    private void runExternalDragScroll() {
++        if (!externalDragActive || externalDragScrollDirection == 0) {
++            return;
++        }
++        // Directions are physical screen directions. RecyclerView resolves adapter order for RTL.
++        if (listView.canScrollHorizontally(externalDragScrollDirection)) {
++            listView.scrollBy(externalDragScrollDirection * Math.max(1, Math.round(externalDragScrollSpeed)), 0);
++        } else {
++            externalDragScrollDirection = 0;
++            externalDragScrollSpeed = 0f;
++            removeCallbacks(externalDragScrollRunnable);
++            return;
++        }
++        postOnAnimation(externalDragScrollRunnable);
++    }
++
++    private void updateExternalDragTarget() {
++        if (!externalDragActive || Float.isNaN(externalDragRawX)) {
++            setExternalDragTargetPosition(RecyclerView.NO_POSITION);
++            return;
++        }
++        listView.getLocationOnScreen(externalDragLocation);
++        float localX = externalDragRawX - externalDragLocation[0];
++        View child = listView.findChildViewUnder(
++                localX,
++                listView.getHeight() / 2f
++        );
++        int candidatePosition = child == null ? RecyclerView.NO_POSITION : listView.getChildAdapterPosition(child);
++        Tab candidateTab = getTab(candidatePosition);
++        if (candidateTab == null || candidateTab.isDefault || candidateTab.isLocked) {
++            candidatePosition = RecyclerView.NO_POSITION;
++        }
++
++        if (externalDragTargetPosition == RecyclerView.NO_POSITION) {
++            if (candidatePosition == RecyclerView.NO_POSITION || !isInsideExternalDragCandidate(child, externalDragRawX)) {
++                setExternalDragTargetPosition(RecyclerView.NO_POSITION);
++            } else {
++                setExternalDragTargetPosition(candidatePosition);
++            }
++            return;
++        }
++        if (candidatePosition == externalDragTargetPosition) {
++            return;
++        }
++
++        RecyclerView.ViewHolder currentHolder = listView.findViewHolderForAdapterPosition(externalDragTargetPosition);
++        View currentTarget = currentHolder == null ? externalDragTargetView : currentHolder.itemView;
++        if (currentTarget == null || currentTarget.getParent() == null) {
++            if (candidatePosition != RecyclerView.NO_POSITION && isInsideExternalDragCandidate(child, externalDragRawX)) {
++                setExternalDragTargetPosition(candidatePosition);
++            }
++            return;
++        }
++
++        float currentLeft = getStableChildLeftOnScreen(currentTarget);
++        float currentRight = currentLeft + currentTarget.getWidth();
++        float currentCenter = (currentLeft + currentRight) / 2f;
++        int switchOffset = dp(12);
++        if (child == null) {
++            if (externalDragRawX < currentLeft - switchOffset || externalDragRawX > currentRight + switchOffset) {
++                setExternalDragTargetPosition(RecyclerView.NO_POSITION);
++            }
++            return;
++        }
++
++        float candidateCenter = getStableChildLeftOnScreen(child) + child.getWidth() / 2f;
++        boolean crossedHysteresis = candidateCenter > currentCenter
++                ? externalDragRawX >= currentRight + switchOffset
++                : externalDragRawX <= currentLeft - switchOffset;
++        if (crossedHysteresis) {
++            setExternalDragTargetPosition(candidatePosition);
++        }
++    }
++
++    private boolean isInsideExternalDragCandidate(View child, float rawX) {
++        if (child == null) {
++            return false;
++        }
++        float childLeft = getStableChildLeftOnScreen(child);
++        int halfDeadZone = dp(8);
++        float inset = Math.min(halfDeadZone, child.getWidth() / 4f);
++        return rawX >= childLeft + inset
++                && rawX <= childLeft + child.getWidth() - inset;
++    }
++
++    private float getStableChildLeftOnScreen(View child) {
++        listView.getLocationOnScreen(externalDragLocation);
++        return externalDragLocation[0] + child.getLeft();
++    }
++
++    private void setExternalDragTargetPosition(int position) {
++        if (externalDragTargetPosition == position && externalDragTargetView != null) {
++            return;
++        }
++        if (externalDragTargetAnimator != null) {
++            externalDragTargetAnimator.cancel();
++            externalDragTargetAnimator = null;
++        }
++        int previousPosition = externalDragTargetPosition;
++        boolean targetChanged = previousPosition != position;
++        externalDragTargetPosition = position;
++        externalDragTargetView = null;
++        externalDragTargetProgress = 0f;
++        if (position != RecyclerView.NO_POSITION) {
++            RecyclerView.ViewHolder holder = listView.findViewHolderForAdapterPosition(position);
++            if (holder != null) {
++                externalDragTargetView = holder.itemView;
++                if (targetChanged && previousPosition != RecyclerView.NO_POSITION) {
++                    try {
++                        externalDragTargetView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS, HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING);
++                    } catch (Exception ignored) {
++                    }
++                }
++                externalDragTargetAnimator = ValueAnimator.ofFloat(0f, 1f);
++                externalDragTargetAnimator.setDuration(150);
++                externalDragTargetAnimator.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
++                externalDragTargetAnimator.addUpdateListener(animation -> {
++                    externalDragTargetProgress = (float) animation.getAnimatedValue();
++                    invalidate();
++                });
++                externalDragTargetAnimator.start();
++            }
++        }
++        invalidate();
++    }
++
+     public int getNextPageId(boolean forward) {
+         return positionToId.get(currentPosition + (forward ? 1 : -1), -1);
+     }
+@@ -1259,7 +1591,7 @@ public class FilterTabsView extends FrameLayout {
+         return title;
+     }
+ 
+-    public void addTab(int id, int stableId, String text, ArrayList<TLRPC.MessageEntity> entities, boolean noanimate, boolean isDefault, boolean isLocked) {
++    public void addTab(int id, int stableId, int dialogFilterId, String text, ArrayList<TLRPC.MessageEntity> entities, boolean noanimate, boolean isDefault, boolean isLocked) {
+         int position = tabs.size();
+         if (position == 0 && selectedTabId == -1) {
+             selectedTabId = id;
+@@ -1272,13 +1604,14 @@ public class FilterTabsView extends FrameLayout {
+         }
+ 
+         Tab tab = new Tab(id, text(text, entities), noanimate);
++        tab.dialogFilterId = dialogFilterId;
+         tab.isDefault = isDefault;
+         tab.isLocked = isLocked;
+         allTabsWidth += tab.getWidth(true) + dp(TAB_PADDING_WIDTH);
+         tabs.add(tab);
+     }
+ 
+-    public void addTab(int id, int stableId, CharSequence text, boolean noanimate, boolean isDefault, boolean isLocked) {
++    public void addTab(int id, int stableId, int dialogFilterId, CharSequence text, boolean noanimate, boolean isDefault, boolean isLocked) {
+         int position = tabs.size();
+         if (position == 0 && selectedTabId == -1) {
+             selectedTabId = id;
+@@ -1291,6 +1624,7 @@ public class FilterTabsView extends FrameLayout {
+         }
+ 
+         Tab tab = new Tab(id, text, noanimate);
++        tab.dialogFilterId = dialogFilterId;
+         tab.isDefault = isDefault;
+         tab.isLocked = isLocked;
+         allTabsWidth += tab.getWidth(true) + dp(TAB_PADDING_WIDTH);
+@@ -1528,10 +1862,43 @@ public class FilterTabsView extends FrameLayout {
+     protected void dispatchDraw(@NonNull Canvas canvas) {
+         canvas.save();
+         canvas.clipPath(clipPath);
++        drawExternalDragTarget(canvas);
+         super.dispatchDraw(canvas);
+         canvas.restore();
+     }
+ 
++    private void drawExternalDragTarget(Canvas canvas) {
++        if (!externalDragActive || externalDragTargetPosition == RecyclerView.NO_POSITION) {
++            return;
++        }
++        RecyclerView.ViewHolder holder = listView.findViewHolderForAdapterPosition(externalDragTargetPosition);
++        if (holder == null) {
++            return;
++        }
++        View target = holder.itemView;
++        externalDragTargetPaint.setColor(Theme.getColor(tabLineColorKey, resourcesProvider));
++        externalDragTargetPaint.setAlpha(52);
++        float left = listView.getX() + target.getX() - dp(4);
++        float right = left + target.getWidth() + dp(8);
++        float minWidth = dp(88);
++        if (right - left < minWidth) {
++            float center = (left + right) / 2f;
++            left = center - minWidth / 2f;
++            right = center + minWidth / 2f;
++        }
++        float top = dp(15);
++        float bottom = getHeight() - dp(15);
++        float radius = Math.max(0, (bottom - top) / 2f);
++        float targetScale = lerp(0.94f, 1.08f, externalDragTargetProgress);
++        float centerX = (left + right) / 2f;
++        float centerY = (top + bottom) / 2f;
++        canvas.save();
++        canvas.scale(targetScale, targetScale, centerX, centerY);
++        externalDragTargetPaint.setAlpha(Math.round(externalDragTargetPaint.getAlpha() * externalDragTargetProgress));
++        canvas.drawRoundRect(left, top, right, bottom, radius, radius, externalDragTargetPaint);
++        canvas.restore();
++    }
++
+     public void updateColors() {
+         if (blurredBackgroundDrawable != null) {
+             blurredBackgroundDrawable.updateColors();
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+index 0c5dc3fb8..5b7079f4b 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+@@ -38,6 +38,7 @@ import android.graphics.Canvas;
+ import android.graphics.Color;
+ import android.graphics.ColorFilter;
+ import android.graphics.Paint;
++import android.graphics.Path;
+ import android.graphics.PixelFormat;
+ import android.graphics.PointF;
+ import android.graphics.PorterDuff;
+@@ -56,6 +57,8 @@ import android.provider.Settings;
+ import android.text.Spannable;
+ import android.text.SpannableStringBuilder;
+ import android.text.Spanned;
++import android.text.Layout;
++import android.text.StaticLayout;
+ import android.text.TextPaint;
+ import android.text.TextUtils;
+ import android.text.style.ImageSpan;
+@@ -90,6 +93,9 @@ import androidx.core.graphics.Insets;
+ import androidx.core.math.MathUtils;
+ import androidx.core.view.ViewCompat;
+ import androidx.core.view.WindowInsetsCompat;
++import androidx.dynamicanimation.animation.FloatValueHolder;
++import androidx.dynamicanimation.animation.SpringAnimation;
++import androidx.dynamicanimation.animation.SpringForce;
+ import androidx.recyclerview.widget.ItemTouchHelper;
+ import androidx.recyclerview.widget.LinearLayoutManager;
+ import org.telegram.ui.recyclerview.LinearSmoothScrollerCustom;
+@@ -375,6 +381,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         private int lastItemsCount;
+         private DialogsItemAnimator dialogsItemAnimator;
+         private RecyclerItemsEnterAnimator recyclerItemsEnterAnimator;
++        private float lastTouchRawX = Float.NaN;
++        private float lastTouchRawY = Float.NaN;
++        private int folderDragActivePointerId = MotionEvent.INVALID_POINTER_ID;
+ 
+         private boolean isLocked;
+         public boolean animateStoriesView;
+@@ -535,6 +544,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     float panTranslationY;
+ 
+     private View blurredView;
++    private Bitmap folderDragBackdropBitmap;
++    private final Paint folderDragBackdropPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
++    private final Rect folderDragBackdropBounds = new Rect();
++    private ValueAnimator folderDragBackdropAnimator;
++    private float folderDragBackdropProgress;
++    private boolean capturingFolderDragBackdrop;
+ 
+     private ItemOptions filterOptions;
+ 
+@@ -887,6 +902,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+ 
+         @Override
+         protected boolean drawChild(Canvas canvas, View child, long drawingTime) {
++            if (capturingFolderDragBackdrop && child == filterTabsView) {
++                return true;
++            }
+             if (child == blurredView) {
+                 return true;
+             }
+@@ -1120,6 +1138,16 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                     blurredView.draw(canvas);
+                 }
+             }
++            if (!capturingFolderDragBackdrop && folderDragBackdropBitmap != null && folderDragBackdropProgress > 0f) {
++                folderDragBackdropPaint.setAlpha(Math.round(255 * folderDragBackdropProgress));
++                folderDragBackdropBounds.set(0, 0, getWidth(), getHeight());
++                canvas.drawBitmap(folderDragBackdropBitmap, null, folderDragBackdropBounds, folderDragBackdropPaint);
++                int scrimAlpha = Math.round(255 * 0.72f * folderDragBackdropProgress);
++                canvas.drawColor(ColorUtils.setAlphaComponent(getThemedColor(Theme.key_windowBackgroundWhite), scrimAlpha));
++                if (filterTabsView != null && filterTabsView.getVisibility() == View.VISIBLE) {
++                    drawChild(canvas, filterTabsView, getDrawingTime());
++                }
++            }
+             if (!hasMainTabs && communityId == 0) {
+                 AndroidUtilities.drawNavigationBarProtection(canvas, this, getThemedColor(Theme.key_windowBackgroundWhite), navigationBarHeight);
+             }
+@@ -2012,11 +2040,49 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+ 
+         @Override
+         public boolean dispatchTouchEvent(MotionEvent ev) {
++            int action = ev.getActionMasked();
++            if (action == MotionEvent.ACTION_DOWN) {
++                parentPage.folderDragActivePointerId = ev.getPointerId(0);
++            }
++            int pointerIndex = parentPage.folderDragActivePointerId == MotionEvent.INVALID_POINTER_ID
++                    ? -1 : ev.findPointerIndex(parentPage.folderDragActivePointerId);
++            if (pointerIndex >= 0) {
++                float rawOffsetX = ev.getRawX() - ev.getX();
++                float rawOffsetY = ev.getRawY() - ev.getY();
++                parentPage.lastTouchRawX = ev.getX(pointerIndex) + rawOffsetX;
++                parentPage.lastTouchRawY = ev.getY(pointerIndex) + rawOffsetY;
++            } else if (action == MotionEvent.ACTION_MOVE && parentPage.folderDragActivePointerId != MotionEvent.INVALID_POINTER_ID) {
++                if (parentPage.swipeController != null) {
++                    parentPage.swipeController.disposeFolderDrag();
++                }
++                parentPage.folderDragActivePointerId = MotionEvent.INVALID_POINTER_ID;
++            }
++            if (action == MotionEvent.ACTION_POINTER_UP
++                    && ev.getPointerId(ev.getActionIndex()) == parentPage.folderDragActivePointerId) {
++                if (parentPage.swipeController != null && parentPage.swipeController.isFolderDragActive()) {
++                    MotionEvent upEvent = MotionEvent.obtain(
++                            ev.getDownTime(), ev.getEventTime(), MotionEvent.ACTION_UP,
++                            ev.getX(ev.getActionIndex()), ev.getY(ev.getActionIndex()), ev.getMetaState());
++                    boolean handled = super.dispatchTouchEvent(upEvent);
++                    upEvent.recycle();
++                    parentPage.folderDragActivePointerId = MotionEvent.INVALID_POINTER_ID;
++                    return handled;
++                }
++                int replacementIndex = ev.getActionIndex() == 0 ? 1 : 0;
++                parentPage.folderDragActivePointerId = replacementIndex < ev.getPointerCount()
++                        ? ev.getPointerId(replacementIndex) : MotionEvent.INVALID_POINTER_ID;
++            }
++            if (action == MotionEvent.ACTION_CANCEL && parentPage.swipeController != null) {
++                parentPage.swipeController.disposeFolderDrag();
++            }
+             if (ev.getAction() == MotionEvent.ACTION_DOWN && ev.getY() < (getPaddingTop() + scrollYOffset)) {
+                 return false;
+             }
+-
+-            return super.dispatchTouchEvent(ev);
++            boolean handled = super.dispatchTouchEvent(ev);
++            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
++                parentPage.folderDragActivePointerId = MotionEvent.INVALID_POINTER_ID;
++            }
++            return handled;
+         }
+ 
+         private boolean drawMovingViewsOverlayed() {
+@@ -2407,6 +2473,24 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         private boolean swipingFolder;
+         private boolean swipeFolderBack;
+         private ViewPage parentPage;
++        private final int[] dragLocation = new int[2];
++        private final int[] folderDragOverlayLocation = new int[2];
++        private final int[] folderDragTargetLocation = new int[2];
++        private final ArrayList<Long> folderDragDialogIds = new ArrayList<>();
++        private final ArrayList<DialogCell> folderDragHiddenViews = new ArrayList<>();
++        private final ArrayList<DialogCell> folderDragManagedViews = new ArrayList<>();
++        private long folderDragSourceDialogId;
++        private float folderDragLastHitRawX = Float.NaN;
++        private float folderDragLastHitRawY = Float.NaN;
++        private int folderDragTargetPosition = RecyclerView.NO_POSITION;
++        private boolean folderDragOverTabs;
++        private boolean folderDragVisualActive;
++        private FolderDragPreviewDrawable folderDragOverlayDrawable;
++        private final ArrayList<FolderDragPreviewDrawable> folderDragActiveOverlays = new ArrayList<>();
++        private ValueAnimator folderDragStackAnimator;
++        private ValueAnimator folderDragDropAnimator;
++        private SpringAnimation folderDragReturnAnimation;
++        private final Rect folderDragInitialReturnBounds = new Rect();
+ 
+         public SwipeController(ViewPage page) {
+             parentPage = page;
+@@ -2429,7 +2513,9 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                 long dialogId = dialogCell.getDialogId();
+                 if (actionBar.isActionModeShowed(null)) {
+                     TLRPC.Dialog dialog = getMessagesController().dialogs_dict.get(dialogId);
+-                    if (!allowMoving || dialog == null || !isDialogPinned(dialog) || DialogObject.isFolderDialogId(dialogId)) {
++                    boolean pinned = dialog != null && isDialogPinned(dialog);
++                    boolean canDragToFolder = canDragDialogToFolder(parentPage, dialogId);
++                    if (!allowMoving || dialog == null || (!pinned && !canDragToFolder) || DialogObject.isFolderDialogId(dialogId)) {
+                         return 0;
+                     }
+                     movingView = (DialogCell) viewHolder.itemView;
+@@ -2469,7 +2555,12 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+ 
+         @Override
+         public boolean onMove(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder source, RecyclerView.ViewHolder target) {
+-            if (!(target.itemView instanceof DialogCell)) {
++            if (!(source.itemView instanceof DialogCell) || !(target.itemView instanceof DialogCell)) {
++                return false;
++            }
++            long sourceDialogId = ((DialogCell) source.itemView).getDialogId();
++            TLRPC.Dialog sourceDialog = getMessagesController().dialogs_dict.get(sourceDialogId);
++            if (sourceDialog == null || !isDialogPinned(sourceDialog) || folderDragDialogIds.size() > 1 || folderDragVisualActive) {
+                 return false;
+             }
+             DialogCell dialogCell = (DialogCell) target.itemView;
+@@ -2658,11 +2749,768 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             }
+             currentItemViewHolder = viewHolder;
+             if (viewHolder != null && viewHolder.itemView instanceof DialogCell) {
+-                ((DialogCell) viewHolder.itemView).swipeCanceled = false;
++                DialogCell dialogCell = (DialogCell) viewHolder.itemView;
++                dialogCell.swipeCanceled = false;
++                if (actionState == ItemTouchHelper.ACTION_STATE_DRAG && canDragDialogToFolder(parentPage, dialogCell.getDialogId())) {
++                    folderDragDialogIds.clear();
++                    folderDragDialogIds.addAll(selectedDialogs);
++                    if (!folderDragDialogIds.contains(dialogCell.getDialogId())) {
++                        folderDragDialogIds.add(dialogCell.getDialogId());
++                    }
++                    folderDragSourceDialogId = dialogCell.getDialogId();
++                    folderDragTargetPosition = RecyclerView.NO_POSITION;
++                    folderDragOverTabs = false;
++                    folderDragVisualActive = false;
++                    folderDragLastHitRawX = Float.NaN;
++                    folderDragLastHitRawY = Float.NaN;
++                    startFolderDragVisuals(dialogCell);
++                }
+             }
+             super.onSelectedChanged(viewHolder, actionState);
+         }
+ 
++        @Override
++        public void onChildDraw(@NonNull Canvas c, @NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder, float dX, float dY, int actionState, boolean isCurrentlyActive) {
++            super.onChildDraw(c, recyclerView, viewHolder, dX, dY, actionState, isCurrentlyActive);
++            if (actionState != ItemTouchHelper.ACTION_STATE_DRAG || folderDragSourceDialogId == 0 || !(viewHolder.itemView instanceof DialogCell) || ((DialogCell) viewHolder.itemView).getDialogId() != folderDragSourceDialogId || filterTabsView == null) {
++                return;
++            }
++            float rawX = parentPage.lastTouchRawX;
++            float rawY = parentPage.lastTouchRawY;
++            if (Float.isNaN(rawX) || Float.isNaN(rawY)) {
++                viewHolder.itemView.getLocationOnScreen(dragLocation);
++                rawX = dragLocation[0] + viewHolder.itemView.getWidth() / 2f;
++                rawY = dragLocation[1] + viewHolder.itemView.getHeight() / 2f;
++            }
++
++            if (!folderDragVisualActive) {
++                startFolderDragVisuals((DialogCell) viewHolder.itemView);
++            }
++
++            float hitDx = Float.isNaN(folderDragLastHitRawX) ? Float.MAX_VALUE : rawX - folderDragLastHitRawX;
++            float hitDy = Float.isNaN(folderDragLastHitRawY) ? Float.MAX_VALUE : rawY - folderDragLastHitRawY;
++            if (Math.hypot(hitDx, hitDy) < dpf2(1.5f)) {
++                updateFolderDragOverlay();
++                return;
++            }
++            folderDragLastHitRawX = rawX;
++            folderDragLastHitRawY = rawY;
++            boolean overTabs = filterTabsView.isInsideExternalDragMagneticZone(rawX, rawY, folderDragOverTabs);
++            setFolderDragOverTabs(overTabs);
++            if (overTabs) {
++                folderDragTargetPosition = filterTabsView.updateExternalDrag(rawX);
++            } else {
++                folderDragTargetPosition = RecyclerView.NO_POSITION;
++                filterTabsView.clearExternalDragTarget();
++            }
++            updateFolderDragOverlay();
++        }
++
++        private void disposeFolderDrag() {
++            if (folderDragStackAnimator != null) {
++                folderDragStackAnimator.cancel();
++                folderDragStackAnimator = null;
++            }
++            if (folderDragReturnAnimation != null) {
++                folderDragReturnAnimation.cancel();
++                folderDragReturnAnimation = null;
++            }
++            if (folderDragDropAnimator != null) {
++                folderDragDropAnimator.cancel();
++                folderDragDropAnimator = null;
++            }
++            if (folderDragSourceDialogId != 0) {
++                finishFolderDrag(false);
++            }
++            forceCleanupFolderDragOverlays();
++            forceCleanupFolderDragBackdrop();
++        }
++
++        private boolean isFolderDragActive() {
++            return folderDragSourceDialogId != 0 || folderDragVisualActive;
++        }
++
++        @Override
++        public void clearView(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder) {
++            ArrayList<Long> dialogIds = new ArrayList<>(folderDragDialogIds);
++            int targetPosition = folderDragOverTabs && filterTabsView != null
++                    ? filterTabsView.getExternalDragTargetPosition()
++                    : folderDragTargetPosition;
++            boolean droppedOnTabs = folderDragVisualActive && folderDragOverTabs;
++            FilterTabsView.Tab targetTab = filterTabsView == null ? null : filterTabsView.getTab(targetPosition);
++            boolean validDropTarget = droppedOnTabs && targetPosition != RecyclerView.NO_POSITION
++                    && targetTab != null && !targetTab.isDefault;
++            super.clearView(recyclerView, viewHolder);
++            if (!dialogIds.isEmpty() && validDropTarget) {
++                animateFolderDragDrop(dialogIds, targetPosition, targetTab.dialogFilterId);
++            } else {
++                finishFolderDrag(folderDragVisualActive);
++            }
++        }
++
++        private void setFolderDragOverTabs(boolean overTabs) {
++            if (folderDragOverTabs == overTabs) {
++                return;
++            }
++            folderDragOverTabs = overTabs;
++            if (!overTabs && folderDragOverlayDrawable != null) {
++                folderDragOverlayDrawable.setSuctionState(0f, Float.NaN, Float.NaN);
++            }
++        }
++
++        private void animateFolderDragDrop(ArrayList<Long> dialogIds, int targetPosition, int dialogFilterId) {
++            if (folderDragStackAnimator != null) {
++                folderDragStackAnimator.cancel();
++                folderDragStackAnimator = null;
++            }
++            ArrayList<DialogCell> hiddenViews = new ArrayList<>(folderDragHiddenViews);
++            folderDragHiddenViews.clear();
++            FolderDragPreviewDrawable overlayDrawable = folderDragOverlayDrawable;
++            boolean hasTarget = filterTabsView != null
++                    && filterTabsView.getExternalDragTargetCenterOnScreen(targetPosition, folderDragTargetLocation);
++
++            folderDragOverlayDrawable = null;
++            folderDragDialogIds.clear();
++            folderDragSourceDialogId = 0;
++            folderDragLastHitRawX = Float.NaN;
++            folderDragLastHitRawY = Float.NaN;
++            folderDragTargetPosition = RecyclerView.NO_POSITION;
++            folderDragOverTabs = false;
++            folderDragVisualActive = false;
++            if (filterTabsView != null) {
++                filterTabsView.stopExternalDrag();
++            }
++            animateFolderDragBackdrop(false);
++
++            if (overlayDrawable == null || fragmentView == null || !hasTarget) {
++                removeFolderDragOverlay(overlayDrawable);
++                restoreFolderDragViews(hiddenViews);
++                AndroidUtilities.runOnUIThread(() -> addDraggedDialogsToFolder(dialogIds, dialogFilterId));
++                return;
++            }
++
++            fragmentView.getLocationOnScreen(folderDragOverlayLocation);
++            Rect startBounds = new Rect(overlayDrawable.getBounds());
++            int targetX = folderDragTargetLocation[0] - folderDragOverlayLocation[0];
++            int targetY = folderDragTargetLocation[1] - folderDragOverlayLocation[1];
++            int targetSize = dp(10);
++            Rect targetBounds = new Rect(
++                    targetX - targetSize / 2,
++                    targetY - targetSize / 2,
++                    targetX + targetSize / 2,
++                    targetY + targetSize / 2
++            );
++            boolean[] canceled = new boolean[1];
++            ValueAnimator animation = ValueAnimator.ofFloat(0f, 1f);
++            folderDragDropAnimator = animation;
++            animation.setDuration(220);
++            animation.setInterpolator(CubicBezierInterpolator.EASE_IN);
++            animation.addUpdateListener(valueAnimator -> {
++                float progress = (float) valueAnimator.getAnimatedValue();
++                int left = Math.round(lerp(startBounds.left, targetBounds.left, progress));
++                int top = Math.round(lerp(startBounds.top, targetBounds.top, progress));
++                int right = Math.round(lerp(startBounds.right, targetBounds.right, progress));
++                int bottom = Math.round(lerp(startBounds.bottom, targetBounds.bottom, progress));
++                overlayDrawable.setBounds(left, top, right, bottom);
++                overlayDrawable.setDropProgress(progress);
++                overlayDrawable.setAlpha(Math.round(255 * (1f - 0.35f * progress)));
++                fragmentView.invalidate();
++            });
++            animation.addListener(new AnimatorListenerAdapter() {
++                @Override
++                public void onAnimationCancel(Animator animation) {
++                    canceled[0] = true;
++                }
++
++                @Override
++                public void onAnimationEnd(Animator animation) {
++                    if (folderDragDropAnimator == animation) {
++                        folderDragDropAnimator = null;
++                    }
++                    removeFolderDragOverlay(overlayDrawable);
++                    restoreFolderDragViews(hiddenViews);
++                    if (!canceled[0]) {
++                        AndroidUtilities.runOnUIThread(() -> addDraggedDialogsToFolder(dialogIds, dialogFilterId));
++                    }
++                }
++            });
++            animation.start();
++        }
++
++        private void finishFolderDrag(boolean returnOverlayToSource) {
++            if (folderDragStackAnimator != null) {
++                folderDragStackAnimator.cancel();
++                folderDragStackAnimator = null;
++            }
++            ArrayList<DialogCell> hiddenViews = new ArrayList<>(folderDragHiddenViews);
++            folderDragHiddenViews.clear();
++            FolderDragPreviewDrawable overlayDrawable = folderDragOverlayDrawable;
++            if (returnOverlayToSource && overlayDrawable != null && fragmentView != null) {
++                animateFolderDragReturn(overlayDrawable, hiddenViews);
++            } else {
++                removeFolderDragOverlay(overlayDrawable);
++                restoreFolderDragViews(hiddenViews);
++            }
++            folderDragOverlayDrawable = null;
++            folderDragDialogIds.clear();
++            folderDragSourceDialogId = 0;
++            folderDragLastHitRawX = Float.NaN;
++            folderDragLastHitRawY = Float.NaN;
++            folderDragTargetPosition = RecyclerView.NO_POSITION;
++            folderDragOverTabs = false;
++            folderDragVisualActive = false;
++            if (filterTabsView != null) {
++                filterTabsView.stopExternalDrag();
++            }
++            animateFolderDragBackdrop(false);
++        }
++
++        private void startFolderDragVisuals(DialogCell dialogCell) {
++            if (folderDragVisualActive) {
++                return;
++            }
++            if (folderDragDropAnimator != null) {
++                folderDragDropAnimator.cancel();
++                folderDragDropAnimator = null;
++            }
++            if (folderDragReturnAnimation != null) {
++                folderDragReturnAnimation.cancel();
++                folderDragReturnAnimation = null;
++            }
++            forceCleanupFolderDragOverlays();
++            folderDragVisualActive = true;
++            createFolderDragOverlay(dialogCell);
++            if (filterTabsView != null) {
++                filterTabsView.startExternalDrag();
++            }
++        }
++
++        private void createFolderDragOverlay(DialogCell dialogCell) {
++            if (fragmentView == null || dialogCell.getWidth() == 0 || dialogCell.getHeight() == 0) {
++                return;
++            }
++            ArrayList<Long> previewDialogIds = new ArrayList<>();
++            previewDialogIds.add(dialogCell.getDialogId());
++            for (int i = 0; i < folderDragDialogIds.size() && previewDialogIds.size() < 3; i++) {
++                long dialogId = folderDragDialogIds.get(i);
++                if (dialogId != dialogCell.getDialogId()) {
++                    previewDialogIds.add(dialogId);
++                }
++            }
++
++            ArrayList<Bitmap> previewCards = new ArrayList<>();
++            for (int i = 0; i < previewDialogIds.size(); i++) {
++                long dialogId = previewDialogIds.get(i);
++                previewCards.add(createCompactDragCard(dialogId, findVisibleDialogCell(dialogId), i == 0));
++            }
++            folderDragOverlayDrawable = new FolderDragPreviewDrawable(previewCards);
++            hideSelectedDialogCells();
++            updateFolderDragReturnBounds(dialogCell, folderDragOverlayDrawable, folderDragInitialReturnBounds);
++            prepareFolderDragBackdrop();
++            fragmentView.getOverlay().add(folderDragOverlayDrawable);
++            folderDragActiveOverlays.add(folderDragOverlayDrawable);
++            updateFolderDragOverlay();
++
++            folderDragStackAnimator = ValueAnimator.ofFloat(0f, 1f);
++            folderDragStackAnimator.setDuration(220);
++            folderDragStackAnimator.setInterpolator(CubicBezierInterpolator.EASE_OUT_BACK);
++            folderDragStackAnimator.addUpdateListener(animation -> {
++                if (folderDragOverlayDrawable != null) {
++                    folderDragOverlayDrawable.setStackProgress((float) animation.getAnimatedValue());
++                }
++            });
++            folderDragStackAnimator.start();
++        }
++
++        private void updateFolderDragReturnBounds(DialogCell dialogCell, FolderDragPreviewDrawable drawable, Rect outBounds) {
++            if (dialogCell == null || drawable == null || fragmentView == null) {
++                return;
++            }
++            fragmentView.getLocationOnScreen(folderDragOverlayLocation);
++            dialogCell.getLocationOnScreen(dragLocation);
++            int width = drawable.getIntrinsicWidth();
++            int height = drawable.getIntrinsicHeight();
++            int left = LocaleController.isRTL
++                    ? dragLocation[0] + dialogCell.getWidth() - width - dp(10) - folderDragOverlayLocation[0]
++                    : dragLocation[0] + dp(10) - folderDragOverlayLocation[0];
++            int top = dragLocation[1] + (dialogCell.getHeight() - height) / 2 - folderDragOverlayLocation[1];
++            left = Math.max(dp(4), Math.min(left, fragmentView.getWidth() - width - dp(4)));
++            top = Math.max(dp(4), Math.min(top, fragmentView.getHeight() - height - dp(4)));
++            outBounds.set(left, top, left + width, top + height);
++        }
++
++        private void animateFolderDragReturn(FolderDragPreviewDrawable drawable, ArrayList<DialogCell> hiddenViews) {
++            if (fragmentView == null) {
++                removeFolderDragOverlay(drawable);
++                restoreFolderDragViews(hiddenViews);
++                return;
++            }
++            if (folderDragReturnAnimation != null) {
++                folderDragReturnAnimation.cancel();
++            }
++            Rect startBounds = new Rect(drawable.getBounds());
++            Rect targetBounds = new Rect(folderDragInitialReturnBounds);
++            DialogCell sourceView = findVisibleDialogCell(folderDragSourceDialogId);
++            if (sourceView != null) {
++                updateFolderDragReturnBounds(sourceView, drawable, targetBounds);
++            }
++            FloatValueHolder progress = new FloatValueHolder(0f);
++            SpringAnimation animation = new SpringAnimation(progress);
++            folderDragReturnAnimation = animation;
++            animation.setSpring(new SpringForce(1f)
++                    .setStiffness(SpringForce.STIFFNESS_MEDIUM)
++                    .setDampingRatio(SpringForce.DAMPING_RATIO_LOW_BOUNCY));
++            animation.addUpdateListener((springAnimation, value, velocity) -> {
++                float alphaProgress = Math.max(0f, Math.min(1f, value));
++                int left = Math.round(startBounds.left + (targetBounds.left - startBounds.left) * value);
++                int top = Math.round(startBounds.top + (targetBounds.top - startBounds.top) * value);
++                int right = Math.round(startBounds.right + (targetBounds.right - startBounds.right) * value);
++                int bottom = Math.round(startBounds.bottom + (targetBounds.bottom - startBounds.bottom) * value);
++                drawable.setBounds(left, top, right, bottom);
++                drawable.setAlpha(Math.round(255 * (1f - 0.15f * alphaProgress)));
++                fragmentView.invalidate();
++            });
++            animation.addEndListener((springAnimation, canceled, value, velocity) -> {
++                if (folderDragReturnAnimation == animation) {
++                    folderDragReturnAnimation = null;
++                }
++                removeFolderDragOverlay(drawable);
++                restoreFolderDragViews(hiddenViews);
++            });
++            animation.start();
++        }
++
++        private void removeFolderDragOverlay(FolderDragPreviewDrawable drawable) {
++            if (drawable == null) {
++                return;
++            }
++            if (folderDragOverlayDrawable == drawable) {
++                folderDragOverlayDrawable = null;
++            }
++            folderDragActiveOverlays.remove(drawable);
++            if (fragmentView != null) {
++                fragmentView.getOverlay().remove(drawable);
++            }
++            drawable.recycle();
++        }
++
++        private void forceCleanupFolderDragOverlays() {
++            ArrayList<FolderDragPreviewDrawable> overlays = new ArrayList<>(folderDragActiveOverlays);
++            folderDragActiveOverlays.clear();
++            if (folderDragOverlayDrawable != null && !overlays.contains(folderDragOverlayDrawable)) {
++                overlays.add(folderDragOverlayDrawable);
++            }
++            folderDragOverlayDrawable = null;
++            for (int i = 0; i < overlays.size(); i++) {
++                FolderDragPreviewDrawable drawable = overlays.get(i);
++                if (fragmentView != null) {
++                    fragmentView.getOverlay().remove(drawable);
++                }
++                drawable.recycle();
++            }
++            if (!folderDragManagedViews.isEmpty() || !folderDragHiddenViews.isEmpty()) {
++                ArrayList<DialogCell> hiddenViews = new ArrayList<>(folderDragManagedViews);
++                for (int i = 0; i < folderDragHiddenViews.size(); i++) {
++                    DialogCell dialogCell = folderDragHiddenViews.get(i);
++                    if (!hiddenViews.contains(dialogCell)) {
++                        hiddenViews.add(dialogCell);
++                    }
++                }
++                folderDragHiddenViews.clear();
++                folderDragManagedViews.clear();
++                restoreFolderDragViews(hiddenViews);
++            }
++        }
++
++        private void restoreFolderDragViews(ArrayList<DialogCell> hiddenViews) {
++            for (int i = 0; i < hiddenViews.size(); i++) {
++                DialogCell dialogCell = hiddenViews.get(i);
++                if (folderDragVisualActive && folderDragDialogIds.contains(dialogCell.getDialogId())) {
++                    if (!folderDragHiddenViews.contains(dialogCell)) {
++                        folderDragHiddenViews.add(dialogCell);
++                    }
++                    if (!folderDragManagedViews.contains(dialogCell)) {
++                        folderDragManagedViews.add(dialogCell);
++                    }
++                    dialogCell.animate().cancel();
++                    dialogCell.setAlpha(0f);
++                    dialogCell.setScaleX(0.96f);
++                    dialogCell.setScaleY(0.96f);
++                    continue;
++                }
++                folderDragHiddenViews.remove(dialogCell);
++                folderDragManagedViews.remove(dialogCell);
++                dialogCell.animate().cancel();
++                dialogCell.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(160).setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT).start();
++            }
++        }
++
++        private void updateFolderDragOverlay() {
++            if (folderDragOverlayDrawable == null || fragmentView == null) {
++                return;
++            }
++            fragmentView.getLocationOnScreen(folderDragOverlayLocation);
++            float rawX = parentPage.lastTouchRawX;
++            float rawY = parentPage.lastTouchRawY;
++            if (Float.isNaN(rawX) || Float.isNaN(rawY)) {
++                DialogCell sourceView = findVisibleDialogCell(folderDragSourceDialogId);
++                if (sourceView == null) {
++                    return;
++                }
++                sourceView.getLocationOnScreen(dragLocation);
++                rawX = dragLocation[0] + sourceView.getWidth() / 2f;
++                rawY = dragLocation[1] + sourceView.getHeight() / 2f;
++            }
++            int width = folderDragOverlayDrawable.getIntrinsicWidth();
++            int height = folderDragOverlayDrawable.getIntrinsicHeight();
++            int left = Math.round(rawX - folderDragOverlayLocation[0] - width / 2f);
++            int top = Math.round(rawY - folderDragOverlayLocation[1] - height / 2f - dp(30));
++            left = Math.max(dp(4), Math.min(left, fragmentView.getWidth() - width - dp(4)));
++            top = Math.max(dp(4), Math.min(top, fragmentView.getHeight() - height - dp(4)));
++            folderDragOverlayDrawable.setBounds(left, top, left + width, top + height);
++            float suctionProgress = 0f;
++            float suctionTargetX = Float.NaN;
++            float suctionTargetY = Float.NaN;
++            if (folderDragOverTabs && filterTabsView != null) {
++                int targetPosition = filterTabsView.getExternalDragTargetPosition();
++                if (targetPosition != RecyclerView.NO_POSITION
++                        && filterTabsView.getExternalDragTargetCenterOnScreen(targetPosition, folderDragTargetLocation)) {
++                    filterTabsView.getLocationOnScreen(dragLocation);
++                    float stripCenterY = dragLocation[1] + filterTabsView.getHeight() / 2f;
++                    float suctionStartY = dragLocation[1] + filterTabsView.getHeight() + dp(84);
++                    float suctionRange = Math.max(dp(1), suctionStartY - stripCenterY);
++                    suctionProgress = Math.max(0f, Math.min(1f, (suctionStartY - rawY) / suctionRange));
++                    suctionTargetX = folderDragTargetLocation[0] - folderDragOverlayLocation[0];
++                    suctionTargetY = folderDragTargetLocation[1] - folderDragOverlayLocation[1];
++                }
++            }
++            folderDragOverlayDrawable.setSuctionState(suctionProgress, suctionTargetX, suctionTargetY);
++            fragmentView.invalidate();
++        }
++
++        private DialogCell findVisibleDialogCell(long dialogId) {
++            for (int i = 0; i < parentPage.listView.getChildCount(); i++) {
++                View child = parentPage.listView.getChildAt(i);
++                if (child instanceof DialogCell && ((DialogCell) child).getDialogId() == dialogId) {
++                    return (DialogCell) child;
++                }
++            }
++            return null;
++        }
++
++        private void hideSelectedDialogCells() {
++            folderDragHiddenViews.clear();
++            for (int i = 0; i < parentPage.listView.getChildCount(); i++) {
++                View child = parentPage.listView.getChildAt(i);
++                if (child instanceof DialogCell && folderDragDialogIds.contains(((DialogCell) child).getDialogId())) {
++                    DialogCell dialogCell = (DialogCell) child;
++                    folderDragHiddenViews.add(dialogCell);
++                    if (!folderDragManagedViews.contains(dialogCell)) {
++                        folderDragManagedViews.add(dialogCell);
++                    }
++                    dialogCell.animate().cancel();
++                    dialogCell.setAlpha(0f);
++                    dialogCell.setScaleX(0.96f);
++                    dialogCell.setScaleY(0.96f);
++                }
++            }
++        }
++
++        private void syncFolderDragCellVisibility(DialogCell dialogCell) {
++            boolean tracked = folderDragManagedViews.contains(dialogCell);
++            boolean shouldHide = folderDragVisualActive && folderDragDialogIds.contains(dialogCell.getDialogId());
++            if (shouldHide) {
++                if (!folderDragHiddenViews.contains(dialogCell)) {
++                    folderDragHiddenViews.add(dialogCell);
++                }
++                if (!tracked) {
++                    folderDragManagedViews.add(dialogCell);
++                }
++                dialogCell.animate().cancel();
++                dialogCell.setAlpha(0f);
++                dialogCell.setScaleX(0.96f);
++                dialogCell.setScaleY(0.96f);
++            } else if (tracked) {
++                folderDragHiddenViews.remove(dialogCell);
++                folderDragManagedViews.remove(dialogCell);
++                dialogCell.animate().cancel();
++                dialogCell.setAlpha(1f);
++                dialogCell.setScaleX(1f);
++                dialogCell.setScaleY(1f);
++            }
++        }
++
++        private Bitmap createCompactDragCard(long dialogId, DialogCell dialogCell, boolean frontCard) {
++            final int width = dp(156);
++            final int height = dp(54);
++            final int avatarSize = dp(42);
++            final int padding = dp(6);
++            Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
++            Canvas canvas = new Canvas(bitmap);
++
++            Paint backgroundPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++            backgroundPaint.setColor(getThemedColor(Theme.key_windowBackgroundWhite));
++            canvas.drawRoundRect(0, 0, width, height, height / 2f, height / 2f, backgroundPaint);
++            backgroundPaint.setStyle(Paint.Style.STROKE);
++            backgroundPaint.setStrokeWidth(dp(1));
++            backgroundPaint.setColor(getThemedColor(Theme.key_divider));
++            canvas.drawRoundRect(dp(0.5f), dp(0.5f), width - dp(0.5f), height - dp(0.5f), height / 2f, height / 2f, backgroundPaint);
++
++            int avatarLeft = LocaleController.isRTL ? width - padding - avatarSize : padding;
++            int avatarTop = (height - avatarSize) / 2;
++            if (dialogCell != null && dialogCell.avatarImage.getImageWidth() > 0 && dialogCell.avatarImage.getImageHeight() > 0) {
++                float scale = avatarSize / dialogCell.avatarImage.getImageWidth();
++                canvas.save();
++                canvas.translate(avatarLeft - dialogCell.avatarImage.getImageX() * scale, avatarTop - dialogCell.avatarImage.getImageY() * scale);
++                canvas.scale(scale, scale);
++                dialogCell.avatarImage.draw(canvas);
++                canvas.restore();
++            } else {
++                AvatarDrawable avatarDrawable = new AvatarDrawable();
++                TLObject peer = null;
++                if (DialogObject.isEncryptedDialog(dialogId)) {
++                    TLRPC.EncryptedChat encryptedChat = getMessagesController().getEncryptedChat(DialogObject.getEncryptedChatId(dialogId));
++                    if (encryptedChat != null) {
++                        peer = getMessagesController().getUser(encryptedChat.user_id);
++                    }
++                } else if (DialogObject.isUserDialog(dialogId)) {
++                    peer = getMessagesController().getUser(dialogId);
++                } else {
++                    peer = getMessagesController().getChat(-dialogId);
++                }
++                avatarDrawable.setInfo(currentAccount, peer);
++                avatarDrawable.setBounds(avatarLeft, avatarTop, avatarLeft + avatarSize, avatarTop + avatarSize);
++                avatarDrawable.draw(canvas);
++            }
++
++            int textLeft = LocaleController.isRTL ? padding : avatarLeft + avatarSize + dp(8);
++            int textRight = LocaleController.isRTL ? avatarLeft - dp(8) : width - padding;
++            if (frontCard && folderDragDialogIds.size() > 1) {
++                if (LocaleController.isRTL) {
++                    textLeft += dp(24);
++                } else {
++                    textRight -= dp(24);
++                }
++            }
++            int textWidth = Math.max(1, textRight - textLeft);
++            TextPaint namePaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
++            namePaint.setColor(getThemedColor(Theme.key_chats_name));
++            namePaint.setTextSize(dp(15));
++            namePaint.setTypeface(AndroidUtilities.bold());
++            CharSequence name = DialogObject.getName(currentAccount, dialogId);
++            CharSequence ellipsizedName = TextUtils.ellipsize(name == null ? "" : name, namePaint, textWidth, TextUtils.TruncateAt.END);
++            StaticLayout nameLayout = new StaticLayout(ellipsizedName, namePaint, textWidth, Layout.Alignment.ALIGN_NORMAL, 1f, 0f, false);
++            canvas.save();
++            canvas.translate(textLeft, (height - nameLayout.getHeight()) / 2f);
++            nameLayout.draw(canvas);
++            canvas.restore();
++
++            if (frontCard && folderDragDialogIds.size() > 1) {
++                Paint badgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++                float radius = dp(12);
++                float centerX = LocaleController.isRTL ? radius + dp(1) : width - radius - dp(1);
++                float centerY = radius + dp(1);
++                badgePaint.setColor(getThemedColor(Theme.key_chats_actionBackground));
++                canvas.drawCircle(centerX, centerY, radius, badgePaint);
++                badgePaint.setColor(getThemedColor(Theme.key_chats_actionIcon));
++                badgePaint.setTextSize(dp(13));
++                badgePaint.setTypeface(AndroidUtilities.bold());
++                badgePaint.setTextAlign(Paint.Align.CENTER);
++                String count = String.valueOf(folderDragDialogIds.size());
++                Paint.FontMetrics fontMetrics = badgePaint.getFontMetrics();
++                canvas.drawText(count, centerX, centerY - (fontMetrics.ascent + fontMetrics.descent) / 2f, badgePaint);
++            }
++            return bitmap;
++        }
++
++        private class FolderDragPreviewDrawable extends Drawable {
++            private final ArrayList<Bitmap> cards;
++            private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
++            private final Paint suctionPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++            private final Path suctionPath = new Path();
++            private float stackProgress;
++            private float suctionProgress;
++            private float suctionTargetX = Float.NaN;
++            private float suctionTargetY = Float.NaN;
++            private float dropProgress;
++            private int drawableAlpha = 255;
++            private boolean recycled;
++
++            private FolderDragPreviewDrawable(ArrayList<Bitmap> cards) {
++                this.cards = cards;
++            }
++
++            private void setStackProgress(float progress) {
++                stackProgress = progress;
++                invalidateSelf();
++            }
++
++            private void setSuctionState(float progress, float targetX, float targetY) {
++                suctionProgress = Math.max(0f, Math.min(1f, progress));
++                suctionTargetX = targetX;
++                suctionTargetY = targetY;
++                invalidateSelf();
++            }
++
++            private void setDropProgress(float progress) {
++                dropProgress = Math.max(0f, Math.min(1f, progress));
++                invalidateSelf();
++            }
++
++            private void recycle() {
++                if (recycled) {
++                    return;
++                }
++                recycled = true;
++                for (int i = 0; i < cards.size(); i++) {
++                    Bitmap bitmap = cards.get(i);
++                    if (bitmap != null && !bitmap.isRecycled()) {
++                        bitmap.recycle();
++                    }
++                }
++                cards.clear();
++            }
++
++            @Override
++            public void draw(@NonNull Canvas canvas) {
++                if (cards.isEmpty()) {
++                    return;
++                }
++                float centerX = getBounds().exactCenterX();
++                float centerY = getBounds().exactCenterY();
++                float alphaProgress = Math.max(0f, Math.min(1f, stackProgress));
++                float dropScale = lerp(1f, 0.1f, dropProgress);
++                float contentMorphProgress = smoothStep(0.12f, 0.78f, suctionProgress);
++                float contentScaleX = lerp(1f, 0.20f, contentMorphProgress);
++                float contentScaleY = lerp(1f, 0.24f, contentMorphProgress);
++                float cardsAlpha = 1f - smoothStep(0.18f, 0.82f, suctionProgress);
++                if (suctionProgress > 0f) {
++                    drawSuctionBody(canvas, centerX, centerY, contentScaleY, dropScale);
++                }
++                for (int i = cards.size() - 1; i >= 0; i--) {
++                    Bitmap card = cards.get(i);
++                    float scale;
++                    float offsetX = 0;
++                    float offsetY = 0;
++                    float rotation = 0;
++                    float alpha = 0.85f;
++                    if (i == 0) {
++                        scale = (0.94f + 0.06f * alphaProgress) * 0.8f * dropScale;
++                    } else {
++                        float finalScale = i == 1 ? 0.92f : 0.85f;
++                        scale = (1.2f + (finalScale - 1.2f) * stackProgress) * 0.8f * dropScale;
++                        float finalOffsetX = i == 1 ? -dp(6) : dp(8);
++                        float finalOffsetY = i == 1 ? dp(6) : dp(12);
++                        offsetX = finalOffsetX * stackProgress;
++                        offsetY = dp(50) + (finalOffsetY - dp(50)) * stackProgress;
++                        rotation = (i == 1 ? -5f : 5f) * stackProgress;
++                        alpha *= alphaProgress;
++                    }
++                    paint.setAlpha(Math.round(drawableAlpha * alpha * cardsAlpha));
++                    canvas.save();
++                    canvas.translate(centerX + offsetX, centerY + offsetY);
++                    canvas.rotate(rotation);
++                    canvas.scale(scale * contentScaleX, scale * contentScaleY);
++                    canvas.drawBitmap(card, -card.getWidth() / 2f, -card.getHeight() / 2f, paint);
++                    canvas.restore();
++                }
++            }
++
++            private void drawSuctionBody(Canvas canvas, float centerX, float centerY, float contentScaleY, float dropScale) {
++                float targetX = Float.isNaN(suctionTargetX) ? centerX : suctionTargetX;
++                float targetY = Float.isNaN(suctionTargetY) ? centerY : suctionTargetY;
++                float tipProgress = smoothStep(0f, 0.75f, suctionProgress);
++                float baseProgress = smoothStep(0.55f, 1f, suctionProgress);
++                float widthProgress = smoothStep(0.12f, 0.90f, suctionProgress);
++                float capsuleTopY = centerY - dp(21) * contentScaleY * dropScale;
++                float tipX = lerp(centerX, targetX, tipProgress);
++                float tipY = lerp(capsuleTopY, targetY, tipProgress);
++                float baseX = lerp(centerX, targetX, baseProgress);
++                float baseY = lerp(capsuleTopY, targetY + dp(1.5f), baseProgress);
++                float tipHalfWidth = lerp(dp(9), dp(2.8f), widthProgress) * dropScale;
++                float baseHalfWidth = lerp(dp(22), dp(3.2f), widthProgress) * dropScale;
++                float verticalSpan = baseY - tipY;
++                float bendX = (targetX - centerX) * 0.10f * (1f - baseProgress);
++
++                suctionPath.reset();
++                suctionPath.moveTo(tipX - tipHalfWidth, tipY);
++                suctionPath.cubicTo(
++                        tipX - tipHalfWidth * 0.70f + bendX, tipY + verticalSpan * 0.32f,
++                        baseX - baseHalfWidth + bendX, baseY - verticalSpan * 0.36f,
++                        baseX - baseHalfWidth, baseY
++                );
++                suctionPath.cubicTo(
++                        baseX - baseHalfWidth * 0.48f, baseY + dp(2) * dropScale,
++                        baseX + baseHalfWidth * 0.48f, baseY + dp(2) * dropScale,
++                        baseX + baseHalfWidth, baseY
++                );
++                suctionPath.cubicTo(
++                        baseX + baseHalfWidth + bendX, baseY - verticalSpan * 0.36f,
++                        tipX + tipHalfWidth * 0.70f + bendX, tipY + verticalSpan * 0.32f,
++                        tipX + tipHalfWidth, tipY
++                );
++                suctionPath.cubicTo(
++                        tipX + tipHalfWidth * 0.50f, tipY - dp(1.5f) * dropScale,
++                        tipX - tipHalfWidth * 0.50f, tipY - dp(1.5f) * dropScale,
++                        tipX - tipHalfWidth, tipY
++                );
++                suctionPath.close();
++
++                suctionPaint.setStyle(Paint.Style.FILL);
++                suctionPaint.setColor(ColorUtils.blendARGB(
++                        getThemedColor(Theme.key_windowBackgroundWhite),
++                        getThemedColor(Theme.key_chats_actionBackground),
++                        0.30f + 0.16f * suctionProgress
++                ));
++                suctionPaint.setAlpha(Math.round(drawableAlpha * Math.min(0.88f, suctionProgress * 1.35f)));
++                canvas.drawPath(suctionPath, suctionPaint);
++
++                float bubbleProgress = smoothStep(0.72f, 1f, suctionProgress);
++                if (bubbleProgress > 0f) {
++                    float bubbleX = lerp(baseX, targetX, bubbleProgress);
++                    float bubbleY = lerp(baseY, targetY, bubbleProgress);
++                    suctionPaint.setColor(ColorUtils.blendARGB(getThemedColor(Theme.key_windowBackgroundWhite), Color.BLACK, 0.28f));
++                    suctionPaint.setAlpha(Math.round(drawableAlpha * bubbleProgress * 0.68f));
++                    canvas.drawCircle(bubbleX, bubbleY, dp(5.5f) * bubbleProgress * dropScale, suctionPaint);
++                    suctionPaint.setColor(ColorUtils.blendARGB(getThemedColor(Theme.key_chats_actionBackground), Color.BLACK, 0.38f));
++                    suctionPaint.setAlpha(Math.round(drawableAlpha * bubbleProgress * 0.9f));
++                    canvas.drawCircle(bubbleX, bubbleY, dp(3.2f) * bubbleProgress * dropScale, suctionPaint);
++                }
++            }
++
++            private float smoothStep(float from, float to, float value) {
++                float progress = Math.max(0f, Math.min(1f, (value - from) / Math.max(0.001f, to - from)));
++                return progress * progress * (3f - 2f * progress);
++            }
++
++            @Override
++            public void setAlpha(int alpha) {
++                drawableAlpha = alpha;
++                invalidateSelf();
++            }
++
++            @Override
++            public void setColorFilter(@Nullable ColorFilter colorFilter) {
++                paint.setColorFilter(colorFilter);
++                invalidateSelf();
++            }
++
++            @Override
++            public int getOpacity() {
++                return PixelFormat.TRANSLUCENT;
++            }
++
++            @Override
++            public int getIntrinsicWidth() {
++                return dp(154);
++            }
++
++            @Override
++            public int getIntrinsicHeight() {
++                return dp(78);
++            }
++        }
++
+         @Override
+         public long getAnimationDuration(@NonNull RecyclerView recyclerView, int animationType, float animateDx, float animateDy) {
+             if (animationType == ItemTouchHelper.ANIMATION_TYPE_SWIPE_CANCEL) {
+@@ -2693,6 +3541,94 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         }
+     }
+ 
++    private boolean canDragDialogToFolder(ViewPage page, long dialogId) {
++        if (page == null || filterTabsView == null || filterTabsView.getVisibility() != View.VISIBLE || filterTabsView.getTabsCount() <= 1 || searchIsShowed || searching || rightSlidingDialogContainer.hasFragment()) {
++            return false;
++        }
++        if (!page.isDefaultDialogType() || selectedDialogs.isEmpty() || !selectedDialogs.contains(dialogId)) {
++            return false;
++        }
++        for (int i = 0; i < selectedDialogs.size(); i++) {
++            long selectedDialogId = selectedDialogs.get(i);
++            TLRPC.Dialog selectedDialog = getMessagesController().dialogs_dict.get(selectedDialogId);
++            if (DialogObject.isFolderDialogId(selectedDialogId) || getMessagesController().isPromoDialog(selectedDialogId, false) || selectedDialog == null || isDialogPinned(selectedDialog)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private void addDraggedDialogsToFolder(ArrayList<Long> draggedDialogs, int dialogFilterId) {
++        if (filterTabsView == null || getParentActivity() == null) {
++            return;
++        }
++        MessagesController.DialogFilter targetFilter = null;
++        ArrayList<MessagesController.DialogFilter> filters = getMessagesController().getDialogFilters();
++        for (int i = 0; i < filters.size(); i++) {
++            if (filters.get(i).id == dialogFilterId) {
++                targetFilter = filters.get(i);
++                break;
++            }
++        }
++
++        final MessagesController.DialogFilter filter = targetFilter;
++        if (filter == null || filter.isDefault()) {
++            return;
++        }
++        if (filter.locked) {
++            showDialog(new LimitReachedBottomSheet(DialogsActivity.this, fragmentView.getContext(), LimitReachedBottomSheet.TYPE_FOLDERS, currentAccount, null));
++            return;
++        }
++
++        ArrayList<Long> missingDialogs = new ArrayList<>();
++        for (int i = 0; i < draggedDialogs.size(); i++) {
++            long dialogId = draggedDialogs.get(i);
++            if (!filter.includesDialog(getAccountInstance(), dialogId)) {
++                missingDialogs.add(dialogId);
++            }
++        }
++        ArrayList<Long> alwaysShow = FiltersListBottomSheet.getDialogsCount(DialogsActivity.this, filter, missingDialogs, true, false);
++        if (alwaysShow.isEmpty()) {
++            hideActionMode(true);
++            return;
++        }
++
++        int totalCount = filter.alwaysShow.size() + alwaysShow.size();
++        if ((totalCount > getMessagesController().dialogFiltersChatsLimitDefault && !getUserConfig().isPremium()) || totalCount > getMessagesController().dialogFiltersChatsLimitPremium) {
++            showDialog(new LimitReachedBottomSheet(DialogsActivity.this, fragmentView.getContext(), LimitReachedBottomSheet.TYPE_CHATS_IN_FOLDER, currentAccount, null));
++            return;
++        }
++
++        ArrayList<Long> previousAlwaysShow = new ArrayList<>(filter.alwaysShow);
++        ArrayList<Long> previousNeverShow = new ArrayList<>(filter.neverShow);
++        for (int i = 0; i < alwaysShow.size(); i++) {
++            filter.neverShow.remove(alwaysShow.get(i));
++        }
++        filter.alwaysShow.addAll(alwaysShow);
++        FilterCreateActivity.saveFilterToServer(filter, filter.flags, filter.name, filter.entities, filter.title_noanimate, filter.color, filter.alwaysShow, filter.neverShow, filter.pinnedDialogs, false, false, true, true, false, DialogsActivity.this, null);
++
++        if (fragmentView != null) {
++            try {
++                fragmentView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS, HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING);
++            } catch (Exception ignored) {}
++        }
++
++        Runnable undoFolderDrop = () -> {
++            filter.alwaysShow.clear();
++            filter.alwaysShow.addAll(previousAlwaysShow);
++            filter.neverShow.clear();
++            filter.neverShow.addAll(previousNeverShow);
++            FilterCreateActivity.saveFilterToServer(filter, filter.flags, filter.name, filter.entities, filter.title_noanimate, filter.color, filter.alwaysShow, filter.neverShow, filter.pinnedDialogs, false, false, true, true, false, DialogsActivity.this, null);
++        };
++        CharSequence bulletinText = AndroidUtilities.replaceTags(LocaleController.formatSpannable(
++                R.string.FilterChatsAddedToExisting,
++                LocaleController.formatPluralString("ChatsSelected", alwaysShow.size()),
++                filter.name
++        ));
++        BulletinFactory.of(DialogsActivity.this).createUndoBulletin(bulletinText, true, undoFolderDrop, null).show();
++        hideActionMode(true);
++    }
++
+     public interface DialogsActivityDelegate {
+         boolean didSelectDialogs(DialogsActivity fragment, ArrayList<MessagesStorage.TopicKey> dids, CharSequence message, boolean param, boolean notify, int scheduleDate, int scheduleRepeatPeriod, TopicsFragment topicsFragment);
+ 
+@@ -3070,6 +4006,20 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     @Override
+     public void onFragmentDestroy() {
+         super.onFragmentDestroy();
++        if (viewPages != null) {
++            for (int i = 0; i < viewPages.length; i++) {
++                if (viewPages[i] != null && viewPages[i].swipeController != null) {
++                    viewPages[i].swipeController.disposeFolderDrag();
++                }
++            }
++        }
++        if (folderDragBackdropAnimator != null) {
++            folderDragBackdropAnimator.cancel();
++            folderDragBackdropAnimator = null;
++        }
++        folderDragBackdropProgress = 0f;
++        capturingFolderDragBackdrop = false;
++        recycleFolderDragBackdrop();
+         if (observersGroup != null) {
+             observersGroup.removeAllObservers();
+             observersGroup = null;
+@@ -4630,6 +5580,14 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             }
+ 
+             viewPage.dialogsAdapter = new DialogsAdapter(this, context, viewPage.dialogsType, folderId, onlySelect, selectedDialogs, currentAccount, requestPeerType) {
++                @Override
++                public void onBindViewHolder(RecyclerView.ViewHolder holder, int position) {
++                    super.onBindViewHolder(holder, position);
++                    if (holder.itemView instanceof DialogCell && viewPage.swipeController != null) {
++                        viewPage.swipeController.syncFolderDragCellVisibility((DialogCell) holder.itemView);
++                    }
++                }
++
+                 @Override
+                 public void notifyDataSetChanged() {
+                     viewPage.lastItemsCount = getItemCount();
+@@ -6875,10 +7833,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                 filterTabsView.removeTabs();
+                 for (int a = 0, N = filters.size(); a < N; a++) {
+                     if (filters.get(a).isDefault()) {
+-                        filterTabsView.addTab(a, 0, LocaleController.getString(R.string.FilterAllChats), null, false, true, filters.get(a).locked);
++                        filterTabsView.addTab(a, 0, filters.get(a).id, LocaleController.getString(R.string.FilterAllChats), null, false, true, filters.get(a).locked);
+                     } else {
+                         final MessagesController.DialogFilter filter = filters.get(a);
+-                        filterTabsView.addTab(a, filter.localId, filter.name, filter.entities, filter.title_noanimate, false, filters.get(a).locked);
++                        filterTabsView.addTab(a, filter.localId, filter.id, filter.name, filter.entities, filter.title_noanimate, false, filters.get(a).locked);
+                     }
+                 }
+                 if (stableId >= 0) {
+@@ -7236,6 +8194,20 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     @Override
+     public void onPause() {
+         super.onPause();
++        if (viewPages != null) {
++            for (int i = 0; i < viewPages.length; i++) {
++                if (viewPages[i] != null && viewPages[i].swipeController != null) {
++                    viewPages[i].swipeController.disposeFolderDrag();
++                }
++            }
++        }
++        if (folderDragBackdropAnimator != null) {
++            folderDragBackdropAnimator.cancel();
++            folderDragBackdropAnimator = null;
++        }
++        folderDragBackdropProgress = 0f;
++        capturingFolderDragBackdrop = false;
++        recycleFolderDragBackdrop();
+         if (storiesBulletin != null) {
+             storiesBulletin.hide();
+             storiesBulletin = null;
+@@ -8959,6 +9931,96 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         checkUi_mainTabsVisible();
+     }
+ 
++    private void prepareFolderDragBackdrop() {
++        if (fragmentView == null || fragmentView.getMeasuredWidth() == 0 || fragmentView.getMeasuredHeight() == 0) {
++            return;
++        }
++        if (folderDragBackdropAnimator != null) {
++            folderDragBackdropAnimator.cancel();
++            folderDragBackdropAnimator = null;
++        }
++        recycleFolderDragBackdrop();
++        int width = Math.max(1, fragmentView.getMeasuredWidth() / 8);
++        int height = Math.max(1, fragmentView.getMeasuredHeight() / 8);
++        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
++        bitmap.eraseColor(getThemedColor(Theme.key_windowBackgroundWhite));
++        Canvas canvas = new Canvas(bitmap);
++        canvas.scale(1f / 8f, 1f / 8f);
++        capturingFolderDragBackdrop = true;
++        try {
++            fragmentView.draw(canvas);
++        } finally {
++            capturingFolderDragBackdrop = false;
++        }
++        Utilities.stackBlurBitmap(bitmap, Math.max(2, Math.round(AndroidUtilities.density)));
++        folderDragBackdropBitmap = bitmap;
++        folderDragBackdropProgress = 0f;
++        animateFolderDragBackdrop(true);
++    }
++
++    private void animateFolderDragBackdrop(boolean show) {
++        if (show && folderDragBackdropBitmap == null) {
++            return;
++        }
++        if (folderDragBackdropAnimator != null) {
++            folderDragBackdropAnimator.cancel();
++        }
++        float target = show ? 1f : 0f;
++        if (Math.abs(folderDragBackdropProgress - target) < 0.001f) {
++            if (!show) {
++                recycleFolderDragBackdrop();
++            }
++            return;
++        }
++        ValueAnimator animator = ValueAnimator.ofFloat(folderDragBackdropProgress, target);
++        folderDragBackdropAnimator = animator;
++        animator.setDuration(180);
++        animator.setInterpolator(CubicBezierInterpolator.EASE_OUT_QUINT);
++        animator.addUpdateListener(valueAnimator -> {
++            folderDragBackdropProgress = (float) valueAnimator.getAnimatedValue();
++            if (fragmentView != null) {
++                fragmentView.invalidate();
++            }
++        });
++        animator.addListener(new AnimatorListenerAdapter() {
++            @Override
++            public void onAnimationEnd(Animator animation) {
++                if (folderDragBackdropAnimator != animation) {
++                    return;
++                }
++                folderDragBackdropAnimator = null;
++                if (!show) {
++                    folderDragBackdropProgress = 0f;
++                    recycleFolderDragBackdrop();
++                }
++            }
++        });
++        animator.start();
++    }
++
++    private void forceCleanupFolderDragBackdrop() {
++        if (folderDragBackdropAnimator != null) {
++            folderDragBackdropAnimator.cancel();
++            folderDragBackdropAnimator = null;
++        }
++        folderDragBackdropProgress = 0f;
++        capturingFolderDragBackdrop = false;
++        recycleFolderDragBackdrop();
++        if (fragmentView != null) {
++            fragmentView.invalidate();
++        }
++    }
++
++    private void recycleFolderDragBackdrop() {
++        if (folderDragBackdropBitmap != null) {
++            folderDragBackdropBitmap.recycle();
++            folderDragBackdropBitmap = null;
++        }
++        if (fragmentView != null) {
++            fragmentView.invalidate();
++        }
++    }
++
+     @Override
+     public void onTransitionAnimationProgress(boolean isOpen, float progress) {
+         if (rightSlidingDialogContainer != null && rightSlidingDialogContainer.hasFragment()) {
+@@ -9015,6 +10077,13 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     }
+ 
+     private void hideActionMode(boolean animateCheck) {
++        if (viewPages != null) {
++            for (int i = 0; i < viewPages.length; i++) {
++                if (viewPages[i] != null && viewPages[i].swipeController != null) {
++                    viewPages[i].swipeController.disposeFolderDrag();
++                }
++            }
++        }
+         actionBar.hideActionMode();
+         selectedDialogs.clear();
+         if (backDrawable != null) {

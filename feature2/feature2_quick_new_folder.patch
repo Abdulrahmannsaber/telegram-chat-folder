@@ -1,0 +1,66 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+index 0c5dc3fb8..5d44c70ee 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+@@ -522,6 +522,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     private int undoViewIndex;
+     private UndoView[] undoView = new UndoView[2];
+     private FilterTabsView filterTabsView;
++    private int newFolderFilterCountBeforeCreate = -1;
+     private boolean askingForPermissions;
+     private int searchViewPagerIndex;
+     @Nullable
+@@ -3792,6 +3793,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+                                     return PixelFormat.TRANSPARENT;
+                                 }
+                             })
++                            .addIf(defaultTab, R.drawable.menu_folder_add, LocaleController.getString(R.string.FilterNew), DialogsActivity.this::openNewFolder)
+                             .addIf(getMessagesController().getDialogFilters().size() > 1, R.drawable.tabs_reorder, LocaleController.getString(R.string.FilterReorder), () -> {
+                                 filterTabsView.setIsEditing(true);
+                                 showDoneItem(true);
+@@ -7353,6 +7355,17 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+     @Override
+     public void onBecomeFullyVisible() {
+         super.onBecomeFullyVisible();
++        if (newFolderFilterCountBeforeCreate >= 0) {
++            final int previousFilterCount = newFolderFilterCountBeforeCreate;
++            newFolderFilterCountBeforeCreate = -1;
++            if (getMessagesController().getDialogFilters().size() > previousFilterCount) {
++                AndroidUtilities.runOnUIThread(() -> {
++                    if (filterTabsView != null && filterTabsView.getTabsCount() > 0) {
++                        filterTabsView.getTabsContainer().smoothScrollToPosition(filterTabsView.getTabsCount() - 1);
++                    }
++                }, 180);
++            }
++        }
+         if (isArchive()) {
+             SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+             boolean showArchiveHint = preferences.getBoolean("archivehint", true);
+@@ -13625,6 +13638,19 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+         }
+     }
+ 
++    private void openNewFolder() {
++        final int count = getMessagesController().getDialogFilters().size();
++        if (
++            count - 1 >= getMessagesController().dialogFiltersLimitDefault && !getUserConfig().isPremium() ||
++            count >= getMessagesController().dialogFiltersLimitPremium
++        ) {
++            showDialog(new LimitReachedBottomSheet(this, getContext(), LimitReachedBottomSheet.TYPE_FOLDERS, currentAccount, null));
++        } else {
++            newFolderFilterCountBeforeCreate = count;
++            presentFragment(new FilterCreateActivity());
++        }
++    }
++
+     private void showItemOptions() {
+         ItemOptions io = ItemOptions.makeOptions(this, optionsItem);
+         io.setColors(getThemedColor(Theme.key_actionBarDefaultTitle), getThemedColor(Theme.key_actionBarDefaultTitle));
+@@ -13723,6 +13749,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
+             Bundle args = new Bundle();
+             presentFragment(new GroupCreateActivity(args));
+         });
++        io.add(R.drawable.menu_folder_add, getString(R.string.FilterNew), this::openNewFolder);
+         io.add(R.drawable.outline_saved_24, getString(R.string.SavedMessages), () -> {
+             Bundle args = new Bundle();
+             args.putLong("user_id", UserConfig.getInstance(currentAccount).getClientUserId());
