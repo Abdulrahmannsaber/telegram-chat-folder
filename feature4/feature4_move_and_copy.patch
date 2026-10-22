@@ -1,0 +1,439 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+--- a/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java
+@@ -584,6 +584,7 @@
+     private ActionBarMenuSubItem addToFolderItem;
+     @Nullable
+     private ActionBarMenuSubItem removeFromFolderItem;
++    private ActionBarMenuSubItem moveToFolderItem;
+     private boolean folderActionInProgress;
+     @Nullable
+     private ActionBarMenuSubItem archiveItem;
+@@ -713,6 +714,7 @@
+     private final static int add_to_folder = 109;
+     private final static int remove_from_folder = 110;
+     private final static int community_ungroup = 111;
++    private final static int move_to_folder = 112;
+ 
+     private final static int ARCHIVE_ITEM_STATE_PINNED = 0;
+     private final static int ARCHIVE_ITEM_STATE_SHOWED = 1;
+@@ -3914,7 +3916,9 @@
+                 } else if (id == 11) {
+                     openAccountSelector(switchItem);
+                 } else if (id == add_to_folder) {
+-                    showFolderActionSheet();
++                    showFolderActionSheet(false);
++                } else if (id == move_to_folder) {
++                    showFolderActionSheet(true);
+                 } else if (id == remove_from_folder) {
+                     MessagesController.DialogFilter filter = getMessagesController().getDialogFilters().get(viewPages[0].selectedType);
+                     ArrayList<Long> neverShow = FiltersListBottomSheet.getDialogsCount(DialogsActivity.this, filter, selectedDialogs, false, false);
+@@ -6690,6 +6694,7 @@
+         pin2Item = otherItem.addSubItem(pin2, R.drawable.msg_pin, LocaleController.getString(R.string.DialogPin));
+         addToFolderItem = otherItem.addSubItem(add_to_folder, R.drawable.msg_addfolder, LocaleController.getString(R.string.FilterAddTo));
+         removeFromFolderItem = otherItem.addSubItem(remove_from_folder, R.drawable.msg_removefolder, LocaleController.getString(R.string.FilterRemoveFrom));
++        moveToFolderItem = otherItem.addSubItem(move_to_folder, R.drawable.msg_folders, LocaleController.getString(R.string.FolderMoveTo));
+         readItem = otherItem.addSubItem(read, R.drawable.msg_markread, LocaleController.getString(R.string.MarkAsRead));
+         clearItem = otherItem.addSubItem(clear, R.drawable.msg_clear, LocaleController.getString(R.string.ClearHistory));
+         blockItem = otherItem.addSubItem(block, R.drawable.msg_block, LocaleController.getString(R.string.BlockUser));
+@@ -9086,6 +9091,18 @@
+         return dialog.pinned;
+     }
+ 
++    private MessagesController.DialogFilter getFolderActionSource() {
++        if (viewPages == null || viewPages[0] == null) {
++            return null;
++        }
++        int type = viewPages[0].dialogsType;
++        if (type != 7 && type != 8) {
++            return null;
++        }
++        MessagesController.DialogFilter filter = getMessagesController().selectedDialogFilter[type == 8 ? 1 : 0];
++        return filter == null || filter.isDefault() ? null : filter;
++    }
++
+     private MessagesController.DialogFilter findFolderActionFilter(int filterId) {
+         for (MessagesController.DialogFilter filter : getMessagesController().getDialogFilters()) {
+             if (filter.id == filterId && !filter.isDefault()) {
+@@ -9095,13 +9112,18 @@
+         return null;
+     }
+ 
+-    private void showFolderActionSheet() {
++    private void showFolderActionSheet(boolean transfer) {
+         if (folderActionInProgress || selectedDialogs.isEmpty() || getParentActivity() == null) {
+             return;
+         }
++        MessagesController.DialogFilter source = transfer ? getFolderActionSource() : null;
++        if (transfer && source == null) {
++            return;
++        }
++        final int sourceId = source == null ? -1 : source.id;
+         final ArrayList<Long> dialogs = new ArrayList<>(selectedDialogs);
+-        FiltersListBottomSheet sheet = new FiltersListBottomSheet(this, dialogs);
+-        sheet.setActionDelegate((targetId, secondary) -> applyFolderAction(dialogs, targetId, secondary));
++        FiltersListBottomSheet sheet = new FiltersListBottomSheet(this, dialogs, sourceId);
++        sheet.setActionDelegate((targetId, secondary) -> applyFolderAction(dialogs, sourceId, targetId, transfer, secondary));
+         showDialog(sheet);
+     }
+ 
+@@ -9120,6 +9142,18 @@
+             return false;
+         }
+         return true;
++    }
++
++    private boolean canRemoveFolderActionDialogs(MessagesController.DialogFilter filter, ArrayList<Long> peers) {
++        if (!filter.isChatlist() && (filter.flags & MessagesController.DIALOG_FILTER_FLAG_ALL_CHATS) != 0) {
++            return true;
++        }
++        for (long did : filter.alwaysShow) {
++            if (!peers.contains(did)) {
++                return true;
++            }
++        }
++        return false;
+     }
+ 
+     private LongSparseIntArray copyFolderActionPins(LongSparseIntArray source) {
+@@ -9202,13 +9236,20 @@
+         return R.string.FolderActionFailed;
+     }
+ 
+-    private void applyFolderAction(ArrayList<Long> dialogs, int targetId, boolean archiveAfter) {
++    private void applyFolderAction(ArrayList<Long> dialogs, int sourceId, int targetId, boolean transfer, boolean secondary) {
+         if (folderActionInProgress || getParentActivity() == null) {
+             return;
+         }
++        final boolean move = transfer && !secondary;
++        final boolean archiveAfter = !transfer && secondary;
+         MessagesController.DialogFilter target = findFolderActionFilter(targetId);
+-        if (target == null) {
++        MessagesController.DialogFilter source = transfer ? findFolderActionFilter(sourceId) : null;
++        if (target == null || targetId == sourceId) {
+             showFolderActionError(R.string.FolderActionTargetMissing);
++            return;
++        }
++        if (transfer && source == null) {
++            showFolderActionError(R.string.FolderActionSourceMissing);
+             return;
+         }
+         final ArrayList<Long> peers = new ArrayList<>();
+@@ -9230,6 +9271,21 @@
+         }
+         if (!checkFolderActionLimit(target, included.size(), excluded.size())) {
+             return;
++        }
++        if (move) {
++            if (!canRemoveFolderActionDialogs(source, peers)) {
++                showFolderActionError(R.string.FolderMoveEmptySource);
++                return;
++            }
++            ArrayList<Long> sourceExcluded = new ArrayList<>(source.neverShow);
++            for (long did : peers) {
++                if (!source.isChatlist() && !sourceExcluded.contains(did)) {
++                    sourceExcluded.add(did);
++                }
++            }
++            if (!checkFolderActionLimit(source, source.alwaysShow.size(), sourceExcluded.size())) {
++                return;
++            }
+         }
+         final ArrayList<Long> stateDialogs = new ArrayList<>(peers);
+         for (long did : dialogs) {
+@@ -9247,31 +9303,34 @@
+                 showFolderActionError(folderActionSaveErrorText(error));
+                 return;
+             }
+-            LongSparseIntArray archivedPins = new LongSparseIntArray();
+-            boolean archiveSkipped = false;
+-            if (archiveAfter) {
+-                ArrayList<Long> toArchive = new ArrayList<>();
+-                for (long did : dialogs) {
+-                    TLRPC.Dialog dialog = getMessagesController().dialogs_dict.get(did);
+-                    if (dialog == null || dialog.folder_id != 0) {
+-                        continue;
+-                    }
+-                    if (did == getUserConfig().getClientUserId() || did == 777000 || getMessagesController().isPromoDialog(did, false)
+-                            || ChatObject.isCommunity(getMessagesController().getChat(-did))) {
+-                        archiveSkipped = true;
+-                        continue;
+-                    }
+-                    archivedPins.put(did, dialog.pinned ? dialog.pinnedNum : 0);
+-                    toArchive.add(did);
+-                }
+-                if (!toArchive.isEmpty()) {
+-                    getMessagesController().addDialogToFolder(toArchive, 1, -1, null, 0);
+-                }
+-            }
+-            int textId = archiveAfter
+-                    ? archiveSkipped ? R.string.FolderArchiveSkipped : R.string.FolderActionArchived : R.string.FolderActionAdded;
+-            finishFolderAction(textId, targetName, targetState, archivedPins);
+-
++            if (move) {
++                removeFolderActionSource(stateDialogs, peers, sourceId, targetState, targetName);
++            } else {
++                LongSparseIntArray archivedPins = new LongSparseIntArray();
++                boolean archiveSkipped = false;
++                if (archiveAfter) {
++                    ArrayList<Long> toArchive = new ArrayList<>();
++                    for (long did : dialogs) {
++                        TLRPC.Dialog dialog = getMessagesController().dialogs_dict.get(did);
++                        if (dialog == null || dialog.folder_id != 0) {
++                            continue;
++                        }
++                        if (did == getUserConfig().getClientUserId() || did == 777000 || getMessagesController().isPromoDialog(did, false)
++                                || ChatObject.isCommunity(getMessagesController().getChat(-did))) {
++                            archiveSkipped = true;
++                            continue;
++                        }
++                        archivedPins.put(did, dialog.pinned ? dialog.pinnedNum : 0);
++                        toArchive.add(did);
++                    }
++                    if (!toArchive.isEmpty()) {
++                        getMessagesController().addDialogToFolder(toArchive, 1, -1, null, 0);
++                    }
++                }
++                int textId = transfer ? R.string.FolderActionCopied : archiveAfter
++                        ? archiveSkipped ? R.string.FolderArchiveSkipped : R.string.FolderActionArchived : R.string.FolderActionAdded;
++                finishFolderAction(textId, targetName, targetState, null, archivedPins);
++            }
+         };
+         if (included.equals(target.alwaysShow) && excluded.equals(target.neverShow)) {
+             afterTarget.run(true, null);
+@@ -9280,36 +9339,80 @@
+         }
+     }
+ 
+-    private void finishFolderAction(int textId, CharSequence targetName, FolderMembershipState target, LongSparseIntArray archivedPins) {
++    private void removeFolderActionSource(ArrayList<Long> dialogs, ArrayList<Long> peers, int sourceId, FolderMembershipState targetState, CharSequence targetName) {
++        MessagesController.DialogFilter source = findFolderActionFilter(sourceId);
++        if (source == null || source.locked) {
++            finishFolderAction(R.string.FolderMovePartial, targetName, targetState, null, new LongSparseIntArray());
++            return;
++        }
++        if (!canRemoveFolderActionDialogs(source, peers)) {
++            finishFolderAction(R.string.FolderMovePartial, targetName, targetState, null, new LongSparseIntArray());
++            return;
++        }
++        FolderMembershipState sourceState = new FolderMembershipState(source, dialogs);
++        ArrayList<Long> included = new ArrayList<>(source.alwaysShow);
++        ArrayList<Long> excluded = new ArrayList<>(source.neverShow);
++        LongSparseIntArray pins = copyFolderActionPins(source.pinnedDialogs);
++        for (long did : dialogs) {
++            pins.delete(did);
++        }
++        for (long did : peers) {
++            included.remove(did);
++            pins.delete(did);
++            if (!source.isChatlist() && !excluded.contains(did)) {
++                excluded.add(did);
++            }
++        }
++        if (!checkFolderActionLimit(source, included.size(), excluded.size())) {
++            finishFolderAction(R.string.FolderMovePartial, targetName, targetState, null, new LongSparseIntArray());
++            return;
++        }
++        FilterCreateActivity.saveFilterToServerWithResult(source, included, excluded, pins, this, success ->
++                finishFolderAction(success ? R.string.FolderActionMoved : R.string.FolderMovePartial, targetName, targetState, success ? sourceState : null, new LongSparseIntArray()));
++    }
++
++    private void finishFolderAction(int textId, CharSequence targetName, FolderMembershipState target, FolderMembershipState source, LongSparseIntArray archivedPins) {
+         folderActionInProgress = false;
+         if (getParentActivity() == null || fragmentView == null) {
+             return;
+         }
+-        CharSequence text = LocaleController.formatString(textId, targetName);
++        CharSequence text = textId == R.string.FolderMovePartial ? LocaleController.getString(textId) : LocaleController.formatString(textId, targetName);
+         BulletinFactory.of(this).createSimpleBulletin(R.raw.folder_in, text, LocaleController.getString(R.string.Undo), 5000,
+-                () -> undoFolderAction(target, archivedPins)).show();
+-    }
+-
+-    private void undoFolderAction(FolderMembershipState target, LongSparseIntArray archivedPins) {
++                () -> undoFolderAction(target, source, archivedPins)).show();
++    }
++
++    private void undoFolderAction(FolderMembershipState target, FolderMembershipState source, LongSparseIntArray archivedPins) {
+         if (folderActionInProgress) {
+             showFolderActionError(R.string.FolderUndoBusy);
+             return;
+         }
+         folderActionInProgress = true;
+-        target.restore(targetRestored -> {
+-            folderActionInProgress = false;
+-            if (!targetRestored) {
++        Utilities.Callback<Boolean> restoreTarget = sourceRestored -> {
++            if (!sourceRestored) {
++                folderActionInProgress = false;
+                 showFolderActionError(R.string.FolderUndoFailed);
+                 return;
+             }
+-            for (int i = 0; i < archivedPins.size(); i++) {
+-                long did = archivedPins.keyAt(i);
+-                TLRPC.Dialog dialog = getMessagesController().dialogs_dict.get(did);
+-                if (dialog != null && dialog.folder_id == 1) {
+-                    getMessagesController().addDialogToFolder(did, 0, archivedPins.valueAt(i), 0);
+-                }
+-            }
+-        });
++            target.restore(targetRestored -> {
++                folderActionInProgress = false;
++                if (!targetRestored) {
++                    showFolderActionError(R.string.FolderUndoFailed);
++                    return;
++                }
++                for (int i = 0; i < archivedPins.size(); i++) {
++                    long did = archivedPins.keyAt(i);
++                    TLRPC.Dialog dialog = getMessagesController().dialogs_dict.get(did);
++                    if (dialog != null && dialog.folder_id == 1) {
++                        getMessagesController().addDialogToFolder(did, 0, archivedPins.valueAt(i), 0);
++                    }
++                }
++            });
++        };
++        if (source != null) {
++            source.restore(restoreTarget);
++        } else {
++            restoreTarget.run(true);
++        }
+     }
+ 
+     private void performSelectedDialogsAction(ArrayList<Long> selectedDialogs, int action, boolean alert, boolean longPress) {
+@@ -10117,6 +10220,9 @@
+             } else {
+                 addToFolderItem.setVisibility(View.GONE);
+             }
++        }
++        if (moveToFolderItem != null) {
++            moveToFolderItem.setVisibility(getFolderActionSource() != null && communityId == 0 ? View.VISIBLE : View.GONE);
+         }
+         if (muteItem != null) {
+             if (canUnmuteCount != 0) {
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/FiltersListBottomSheet.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/FiltersListBottomSheet.java
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/FiltersListBottomSheet.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/FiltersListBottomSheet.java
+@@ -55,6 +55,7 @@
+ 
+     private FiltersListBottomSheetDelegate delegate;
+     private FolderActionDelegate actionDelegate;
++    private final int sourceFilterId;
+     private int selectedFilterId = -1;
+     private ButtonWithCounterView primaryAction;
+     private ButtonWithCounterView secondaryAction;
+@@ -74,14 +75,19 @@
+     private final DialogsActivity fragment;
+ 
+     public FiltersListBottomSheet(DialogsActivity baseFragment, ArrayList<Long> selectedDialogs) {
++        this(baseFragment, selectedDialogs, -1);
++    }
++
++    public FiltersListBottomSheet(DialogsActivity baseFragment, ArrayList<Long> selectedDialogs, int sourceFilterId) {
+         super(baseFragment.getParentActivity(), false);
+         fixNavigationBar();
+         this.selectedDialogs = new ArrayList<>(selectedDialogs);
+         this.fragment = baseFragment;
++        this.sourceFilterId = sourceFilterId;
+ //        dialogFilters = getCanAddDialogFilters(baseFragment, selectedDialogs);
+         dialogFilters = new ArrayList<>(baseFragment.getMessagesController().dialogFilters);
+         for (int i = 0; i < dialogFilters.size(); ++i) {
+-            if (dialogFilters.get(i).isDefault()) {
++            if (dialogFilters.get(i).isDefault() || dialogFilters.get(i).id == sourceFilterId) {
+                 dialogFilters.remove(i);
+                 i--;
+             }
+@@ -233,8 +239,10 @@
+             if (actionDelegate != null) {
+                 MessagesController.DialogFilter filter = adapter.getItem(position);
+                 if (filter == null) {
+-                    dismiss();
+-                    fragment.presentFragment(new FilterCreateActivity(null, getDialogsCount(fragment, null, selectedDialogs, true, false)));
++                    if (sourceFilterId < 0) {
++                        dismiss();
++                        fragment.presentFragment(new FilterCreateActivity(null, getDialogsCount(fragment, null, selectedDialogs, true, false)));
++                    }
+                     return;
+                 }
+                 if (filter.locked) {
+@@ -361,13 +369,13 @@
+     public void setActionDelegate(FolderActionDelegate actionDelegate) {
+         this.actionDelegate = actionDelegate;
+         Context context = getContext();
+-        titleTextView.setText(LocaleController.getString(R.string.FilterChoose));
++        titleTextView.setText(LocaleController.getString(sourceFilterId >= 0 ? R.string.FolderMoveTo : R.string.FilterChoose));
+         FrameLayout actions = new FrameLayout(context);
+         actions.setBackgroundColor(Theme.getColor(Theme.key_dialogBackground));
+         primaryAction = new ButtonWithCounterView(context, resourcesProvider);
+-        primaryAction.setText(LocaleController.getString(R.string.FolderAddOnly), false);
++        primaryAction.setText(LocaleController.getString(sourceFilterId >= 0 ? R.string.FolderMove : R.string.FolderAddOnly), false);
+         secondaryAction = new ButtonWithCounterView(context, false, resourcesProvider);
+-        secondaryAction.setText(LocaleController.getString(R.string.FolderAddAndArchive), false);
++        secondaryAction.setText(LocaleController.getString(sourceFilterId >= 0 ? R.string.FolderCopy : R.string.FolderAddAndArchive), false);
+         primaryAction.setEnabled(false);
+         secondaryAction.setEnabled(false);
+         primaryAction.setAlpha(0.5f);
+@@ -451,7 +459,7 @@
+         @Override
+         public int getItemCount() {
+             int count = dialogFilters.size();
+-            if (count < 10) {
++            if ((actionDelegate == null || sourceFilterId < 0) && count < 10) {
+                 count++;
+             }
+             return count;
+@@ -469,7 +477,7 @@
+                     return false;
+                 }
+                 MessagesController.DialogFilter filter = getItem(holder.getAdapterPosition());
+-                return filter == null || !filter.locked;
++                return filter == null ? sourceFilterId < 0 : !filter.locked;
+             }
+             return true;
+         }
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -3114,12 +3114,20 @@
+     <string name="FilterAddTo">Add to folder</string>
+     <string name="FolderAddOnly">Add only</string>
+     <string name="FolderAddAndArchive">Add and archive</string>
++    <string name="FolderMoveTo">Move to folder…</string>
++    <string name="FolderMove">Move</string>
++    <string name="FolderCopy">Copy</string>
+     <string name="FolderActionFailed">Couldn’t save the folder. Your chats haven’t been archived or removed.</string>
++    <string name="FolderMovePartial">Added to the destination, but couldn’t remove from the original folder.</string>
++    <string name="FolderMoveEmptySource">This folder can’t be left empty. Keep a chat here or use Copy.</string>
+     <string name="FolderActionFoldersLimit">Telegram’s chat folder limit has been reached. Manage your folders before trying again.</string>
+     <string name="FolderActionEmpty">Telegram can’t save an empty folder.</string>
++    <string name="FolderActionSourceMissing">The original folder is no longer available.</string>
+     <string name="FolderActionTargetMissing">This folder is no longer available.</string>
+     <string name="FolderActionAdded">Added to %1$s</string>
+     <string name="FolderActionArchived">Added to %1$s and archived</string>
++    <string name="FolderActionMoved">Moved to %1$s</string>
++    <string name="FolderActionCopied">Copied to %1$s</string>
+     <string name="FolderArchiveSkipped">Added to %1$s. Some chats can’t be archived.</string>
+     <string name="FolderUndoFailed">Couldn’t undo all changes. The chats remain available in their current folders.</string>
+     <string name="FolderUndoBusy">Another folder action is still saving. Please try again.</string>
+diff --git a/TMessagesProj/src/main/res/values-ar/strings.xml b/TMessagesProj/src/main/res/values-ar/strings.xml
+--- a/TMessagesProj/src/main/res/values-ar/strings.xml
++++ b/TMessagesProj/src/main/res/values-ar/strings.xml
+@@ -2,12 +2,20 @@
+ <resources>
+     <string name="FolderAddOnly">إضافة فقط</string>
+     <string name="FolderAddAndArchive">إضافة وأرشفة</string>
++    <string name="FolderMoveTo">نقل إلى مجلد…</string>
++    <string name="FolderMove">نقل</string>
++    <string name="FolderCopy">نسخ</string>
+     <string name="FolderActionFailed">تعذّر حفظ المجلد. لم تتم أرشفة المحادثات أو إزالتها.</string>
++    <string name="FolderMovePartial">تمت الإضافة إلى الوجهة، لكن تعذّرت الإزالة من المجلد الأصلي.</string>
++    <string name="FolderMoveEmptySource">لا يمكن ترك هذا المجلد فارغًا. اترك محادثة فيه أو استخدم «نسخ».</string>
+     <string name="FolderActionFoldersLimit">تم بلوغ حد مجلدات المحادثات لدى تيليجرام. عدّل مجلداتك قبل المحاولة مجددًا.</string>
+     <string name="FolderActionEmpty">لا يقبل تيليجرام حفظ مجلد فارغ.</string>
++    <string name="FolderActionSourceMissing">المجلد الأصلي لم يعد متاحًا.</string>
+     <string name="FolderActionTargetMissing">هذا المجلد لم يعد متاحًا.</string>
+     <string name="FolderActionAdded">تمت الإضافة إلى %1$s</string>
+     <string name="FolderActionArchived">تمت الإضافة إلى %1$s والأرشفة</string>
++    <string name="FolderActionMoved">تم النقل إلى %1$s</string>
++    <string name="FolderActionCopied">تم النسخ إلى %1$s</string>
+     <string name="FolderArchiveSkipped">تمت الإضافة إلى %1$s. بعض المحادثات لا تقبل الأرشفة.</string>
+     <string name="FolderUndoFailed">تعذّر التراجع عن كل التغييرات. المحادثات ما زالت متاحة في مجلداتها الحالية.</string>
+     <string name="FolderUndoBusy">جارٍ حفظ عملية أخرى على المجلدات. حاول مجددًا.</string>
