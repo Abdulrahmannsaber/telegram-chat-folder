@@ -55,16 +55,36 @@ git apply /path/to/feature1_drag_to_folders.patch
 git apply /path/to/feature2_quick_new_folder.patch
 ```
 
-Features 1 and 2 are optional and remain independent. Feature 3 also applies directly to the base version. Apply Feature 4 **after Feature 3**: they share confirmed folder saving and Undo support.
+All four feature patches apply independently to the base version. No feature requires another feature to be installed first.
 
-For Features 3 and 4:
+For **Feature 3 only**, start from the base version:
 
 ```bash
 git apply --check /path/to/feature3_add_and_archive.patch
 git apply /path/to/feature3_add_and_archive.patch
+```
+
+For **Feature 4 only**, start separately from the base version:
+
+```bash
 git apply --check /path/to/feature4_move_and_copy.patch
 git apply /path/to/feature4_move_and_copy.patch
 ```
+
+The standalone Feature 3 and Feature 4 patches contain overlapping folder-saving and Undo code. Do not apply them on top of each other. To enable **both features**, apply this optional combined patch to the base version instead:
+
+```bash
+git apply --check /path/to/features3_and4.patch
+git apply /path/to/features3_and4.patch
+```
+
+Combined patch:
+
+```text
+combined/features3_and4.patch
+```
+
+Features 1 and 2 are optional and can accompany either standalone choice or the combined patch.
 
 Existing account and server limits remain in effect. A manual folder cannot be left empty by Move; keep a chat in it or choose Copy. The existing Remove from folder action remains available under Telegram's original rules.
 
